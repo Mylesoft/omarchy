@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "myles.calculator",
+  "name": "Calculator",
+  "version": "1.0.0",
+  "author": "Myles",
+  "license": "MIT",
+  "description": "Modern multi-mode calculator with live FX, units, tip/VAT, history, and programmer tools",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Calculator",
+    "description": "Calculator with scientific, programmer, FX, units, and tip modes",
+    "category": "Tools",
+    "aliases": [
+      "calc",
+      "calculator",
+      "currency",
+      "fx",
+      "convert"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

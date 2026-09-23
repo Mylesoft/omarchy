@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "myles.clock",
+  "name": "My Clock",
+  "version": "1.0.0",
+  "author": "Omarchy",
+  "description": "Date/time and calendar with merged world-clock places",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "My Clock",
+    "description": "Calendar clock with world times for configured places",
+    "category": "Time",
+    "allowMultiple": false
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.clock"
+  }
+}

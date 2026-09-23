@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "myles.network",
+  "name": "My Network",
+  "version": "1.2.0",
+  "author": "Omarchy",
+  "description": "Wi-Fi list, connection state, and Proton VPN on/off",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "My Network",
+    "description": "Wi-Fi list and connection state, plus Proton VPN toggle",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaults": {
+      "protonCountry": ""
+    },
+    "schema": [
+      {
+        "key": "protonCountry",
+        "type": "string",
+        "label": "Proton VPN country (optional)",
+        "defaultValue": "",
+        "description": "Optional country code or name for connect (e.g. US, NL). Leave empty for the fastest free server."
+      }
+    ]
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.network"
+  }
+}
