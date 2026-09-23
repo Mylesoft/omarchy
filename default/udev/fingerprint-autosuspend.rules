@@ -1,0 +1,5 @@
+## Synaptics VFS5011-style fingerprint readers capture corrupted frames and
+## stop waking from a finger press under USB autosuspend, which fails every
+## auth path that relies on them (lock screen, sudo, polkit). add|change
+## reapplies it when the port re-enumerates after resume.
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="06cb", ATTR{idProduct}=="00f0", ATTR{power/control}="on"
