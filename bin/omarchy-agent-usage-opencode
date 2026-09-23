@@ -53,6 +53,25 @@ def local_day(value):
     return datetime.now().strftime("%Y-%m-%d")
 
 
+def local_hour(value):
+  if value is None:
+    return datetime.now().hour
+  if isinstance(value, (int, float)):
+    try:
+      timestamp = value / 1000 if value > 10_000_000_000 else value
+      return datetime.fromtimestamp(timestamp).hour
+    except (OverflowError, OSError, ValueError):
+      return datetime.now().hour
+  try:
+    text = str(value)
+    parsed = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+    if parsed.tzinfo is not None:
+      parsed = parsed.astimezone()
+    return parsed.hour
+  except (OverflowError, OSError, TypeError, ValueError):
+    return datetime.now().hour
+
+
 def number(value):
   try:
     return int(value or 0)
@@ -130,9 +149,8 @@ def scan_opencode_sessions():
         c["cacheRead"] += cache_read
         c["cacheWrite"] += cache_write
         c["total"] += total
-        created_ms = (entry.get("time") or {}).get("created")
-        created = number(created_ms)
-        hour = int(datetime.fromtimestamp((created / 1000) if created > 10_000_000_000 else created).strftime("%H"))
+        created = (entry.get("time") or {}).get("created")
+        hour = local_hour(created)
         h = bucket["hours"].setdefault(hour, {"count": 0, "tokens": 0})
         h["count"] += 1
         h["tokens"] += total
@@ -222,7 +240,8 @@ def local_stats(buckets):
     active_days.add(day)
 
     if day in recent:
-      recent[day]["messageCount"] = bucket["messages"]
+      # The panel's legacy messageCount field is the token total for the day.
+      recent[day]["messageCount"] = stats_day["total"]
       recent[day]["tokens"] = stats_day["total"]
       recent[day]["prompts"] = bucket["messages"]
     if day == today:
