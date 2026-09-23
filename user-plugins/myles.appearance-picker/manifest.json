@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "myles.appearance-picker",
+  "name": "Appearance Picker",
+  "version": "2.0.0",
+  "author": "Myles",
+  "license": "MIT",
+  "description": "Grouped Omarchy theme and wallpaper picker",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Appearance Picker",
+    "description": "Pick or cycle themes and wallpapers",
+    "category": "Appearance",
+    "allowMultiple": false
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "myles.plugins",
+  "name": "Plugins",
+  "version": "1.0.0",
+  "author": "Myles",
+  "license": "MIT",
+  "description": "Browse installed Omarchy shell plugins and enable or disable them",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Plugins",
+    "description": "List, enable, and disable shell plugins",
+    "category": "Tools",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

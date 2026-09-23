@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "myles.media",
+  "name": "Media",
+  "version": "1.9.0",
+  "author": "Myles",
+  "description": "Media hubs, video PiP, Chromecast/DLNA casting, dual AV, and retryable downloads",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Media",
+    "description": "Left opens panel; transport + fav/download on the bar; right opens Favourites",
+    "category": "Media",
+    "allowMultiple": false
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.media"
+  }
+}

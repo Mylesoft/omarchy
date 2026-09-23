@@ -1,0 +1,94 @@
+{
+  "schemaVersion": 1,
+  "id": "omacom.usage",
+  "name": "Usage & Timer",
+  "version": "1.1.0",
+  "author": "myles",
+  "description": "Track time at the PC (active time today, daily goal, hourly breakdown, streaks, best day, week comparison, top apps with time and share) plus a stopwatch and countdown timer — all with in-drawer analytics and settings.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Usage & Timer",
+    "description": "Analytics dashboard and timer in one bar widget — usage stats, hourly activity, streaks, top apps, countdown and stopwatch.",
+    "category": "Time",
+    "aliases": [
+      "usage",
+      "timer",
+      "usage timer",
+      "stopwatch",
+      "countdown",
+      "pomodoro",
+      "screen time",
+      "analytics"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "goalMinutes": 240,
+      "customMinutes": 25,
+      "idleThresholdSeconds": 60,
+      "barMode": "today",
+      "historyDays": 7,
+      "trackApps": true,
+      "topApps": 5
+    },
+    "schema": [
+      {
+        "key": "goalMinutes",
+        "type": "integer",
+        "label": "Daily active-time goal (minutes)",
+        "min": 15,
+        "max": 1440,
+        "defaultValue": 240
+      },
+      {
+        "key": "customMinutes",
+        "type": "integer",
+        "label": "Custom countdown duration (minutes)",
+        "min": 1,
+        "max": 240,
+        "defaultValue": 25
+      },
+      {
+        "key": "idleThresholdSeconds",
+        "type": "integer",
+        "label": "Seconds of no input before counting time as idle",
+        "min": 10,
+        "max": 600,
+        "defaultValue": 60
+      },
+      {
+        "key": "barMode",
+        "type": "string",
+        "label": "Bar shows (today | session | uptime | apps | open | idle | timer)",
+        "defaultValue": "today"
+      },
+      {
+        "key": "historyDays",
+        "type": "integer",
+        "label": "Days of history to show in the drawer",
+        "min": 1,
+        "max": 30,
+        "defaultValue": 7
+      },
+      {
+        "key": "trackApps",
+        "type": "boolean",
+        "label": "Track focused app time (top apps list)",
+        "defaultValue": true
+      },
+      {
+        "key": "topApps",
+        "type": "integer",
+        "label": "How many top apps to list in the drawer",
+        "min": 1,
+        "max": 15,
+        "defaultValue": 5
+      }
+    ]
+  }
+}

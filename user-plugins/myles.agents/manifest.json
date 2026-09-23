@@ -1,0 +1,103 @@
+{
+  "schemaVersion": 1,
+  "id": "myles.agents",
+  "name": "My Agents",
+  "version": "1.3.0",
+  "author": "Omarchy",
+  "license": "MIT",
+  "description": "Ranked fleet of every installed coding agent with token totals, daily trends, copyable usage summaries, limits, and per-agent launch.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "My Agents",
+    "description": "Auto-discovers installed agents (Claude, Codex, OpenCode, Pi, Crush, Cursor CLI, …); rank by usage; click for analytics; right-click to launch.",
+    "category": "AI",
+    "aliases": [
+      "agents",
+      "model-usage",
+      "tokens"
+    ],
+    "allowMultiple": false,
+    "defaults": {
+      "providers": {
+        "agy": { "enabled": true },
+        "claude": { "enabled": true },
+        "codex": { "enabled": true },
+        "copilot": { "enabled": true },
+        "crush": { "enabled": true },
+        "cursor-agent": { "enabled": true },
+        "fireworks": { "enabled": true },
+        "grok": { "enabled": true },
+        "hermes": { "enabled": true },
+        "muse": { "enabled": true },
+        "omp": { "enabled": true },
+        "opencode": { "enabled": true },
+        "ori": { "enabled": true },
+        "pi": { "enabled": true }
+      },
+      "costRates": {},
+      "refreshIntervalSec": 900,
+      "syncMode": "Off",
+      "syncDir": "",
+      "syncFileName": "",
+      "syncDeviceId": ""
+    },
+    "schema": [
+      {
+        "key": "costRates",
+        "type": "string",
+        "label": "Cost rates JSON: per-model USD per 1M tokens (e.g. {\"big-pickle\":{\"input\":5,\"output\":20,\"cacheRead\":0.5,\"cacheWrite\":6}})",
+        "defaultValue": ""
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 900
+      },
+      {
+        "key": "syncMode",
+        "type": "enum",
+        "label": "Synced aggregation",
+        "options": [
+          "Off",
+          "On"
+        ],
+        "defaultValue": "Off",
+        "description": "When On, write this machine's local usage snapshot and merge snapshots from other machines."
+      },
+      {
+        "key": "syncDir",
+        "type": "path",
+        "label": "Sync folder",
+        "defaultValue": "",
+        "description": "A folder synced by Syncthing, Dropbox, rsync, etc."
+      },
+      {
+        "key": "syncFileName",
+        "type": "string",
+        "label": "Snapshot file name",
+        "defaultValue": "",
+        "description": "Optional. Defaults to <hostname>.json. Use a different file name on each machine, such as laptop.json or desktop.json."
+      },
+      {
+        "key": "syncDeviceId",
+        "type": "string",
+        "label": "Device id",
+        "defaultValue": "",
+        "description": "Optional stable device name used inside synced aggregate snapshots."
+      }
+    ]
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.agents"
+  }
+}
