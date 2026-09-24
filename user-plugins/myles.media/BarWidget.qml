@@ -77,7 +77,10 @@ BarWidget {
       root.mediaService.cancelDownload()
       return
     }
-    if (root.canDownload) root.mediaService.downloadCurrent()
+    if (root.canDownload) {
+      root.mediaService.downloadCurrent()
+      if (root.mediaService.downloadChoicePending) root.openPanel()
+    }
   }
 
   // Shape contract for shell.summon/hide/toggle (Bar.findPanelWidget).

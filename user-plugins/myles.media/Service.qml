@@ -56,6 +56,10 @@ Item {
   // Source-rail pins (persisted). Defaults: Radio Garden, Spotify, YouTube.
   property var pinnedHubIds: []
   property bool downloadBusy: false
+  property bool downloadChoicePending: false
+  property var pendingDownloadPayload: null
+  property string directUrl: ""
+  property string sourceActionError: ""
   property bool downloadCancelled: false
   property string downloadError: ""
   property real downloadProgress: 0
@@ -1886,6 +1890,11 @@ Item {
       } catch (e) {
         parsed = { ok: false, tracks: [], error: "bad-json" }
       }
+      if (parsed.ok && parsed.tracks.length === 0 && Array.isArray(parsed.perProvider)) {
+        var failed = parsed.perProvider.filter(function(p) { return p && p.ok === false })
+        if (failed.length)
+          parsed.error = failed.map(function(p) { return String(p.label || p.provider || "Source") + ": " + String(p.error || "unavailable") }).join(" · ")
+      }
     } else {
       parsed = backend === "youtube"
         ? MediaModel.parseYoutubeSearchResults(text)
@@ -1915,6 +1924,7 @@ Item {
 
   function playSearchResult(hit) {
     if (!hit) return false
+    sourceActionError = ""
 
     var hubPlay = activeHubDef()
 
@@ -1949,6 +1959,7 @@ Item {
       searchHint: String(hit.searchHint || ""),
       frequency: String(hit.frequency || ""),
       video: !!hit.video,
+      isVideo: !!hit.isVideo,
       ffprobeVideo: hit.ffprobeVideo,
       queueOnly: !!hit.queueOnly
     }
@@ -2112,6 +2123,17 @@ Item {
         provider = "spotify"
     }
 
+    var downloadFormat = String(opts.format || "")
+    var videoHit = MediaModel.hitIsVideo(hit || { path: path, provider: provider })
+    if (videoHit && downloadFormat !== "video" && downloadFormat !== "mp3") {
+      pendingDownloadPayload = { hit: hit || { title: trackTitle, artist: trackArtist, path: path, provider: provider }, opts: opts }
+      downloadChoicePending = true
+      downloadError = ""
+      showOsd("Choose video or MP3", "media")
+      return true
+    }
+    downloadChoicePending = false
+
     var payload = {
       title: trackTitle,
       artist: trackArtist,
@@ -2124,6 +2146,7 @@ Item {
       identity: identity,
       searchHint: searchHint
     }
+    payload.downloadFormat = downloadFormat || "mp3"
     if (opts.recordMinutes !== undefined && opts.recordMinutes !== null)
       payload.recordMinutes = Number(opts.recordMinutes)
     if (opts.recordSeconds !== undefined && opts.recordSeconds !== null)
@@ -2144,6 +2167,50 @@ Item {
     showOsd("Downloading…", "media")
     scheduleHubRebuild()
     return true
+  }
+
+  function chooseDownloadFormat(format) {
+    if (!downloadChoicePending || !pendingDownloadPayload) return false
+    var pending = pendingDownloadPayload
+    pendingDownloadPayload = null
+    downloadChoicePending = false
+    var next = Object.assign({}, pending.opts || {}, { hit: pending.hit, format: format })
+    return downloadCurrent(next)
+  }
+
+  function cancelDownloadChoice() {
+    downloadChoicePending = false
+    pendingDownloadPayload = null
+  }
+
+  function playDirectUrl(rawUrl) {
+    var u = String(rawUrl || "").trim()
+    if (!/^https?:\/\//i.test(u)) { sourceActionError = "Enter a complete http(s) URL"; return false }
+    var host = u.replace(/^https?:\/\//i, "").split(/[/?#]/)[0]
+    var provider = /(^|\.)youtu\.be$|(^|\.)youtube\.com$/i.test(host) ? "youtube"
+      : (/radio\.garden$/i.test(host) ? "radio-garden" : "url")
+    var title = u.split(/[/?#]/).filter(Boolean).pop() || host
+    try { title = decodeURIComponent(title.replace(/\+/g, " ")) } catch (e) {}
+    sourceActionError = ""
+    directUrl = u
+    var ok = playSearchResult({ title: title, path: u, provider: provider,
+      video: provider === "youtube" || MediaModel.pathHasVideoExt(u), stream: /\.(m3u8|mpd)(\?|$)/i.test(u) })
+    if (!ok) sourceActionError = "Could not start this URL. Check that it is public and playable."
+    return ok
+  }
+
+  function downloadDirectUrl(rawUrl) {
+    var u = String(rawUrl || "").trim()
+    if (!/^https?:\/\//i.test(u)) { sourceActionError = "Enter a complete http(s) URL"; return false }
+    var host = u.replace(/^https?:\/\//i, "").split(/[/?#]/)[0]
+    var provider = /(^|\.)youtu\.be$|(^|\.)youtube\.com$/i.test(host) ? "youtube"
+      : (/radio\.garden$/i.test(host) ? "radio-garden" : "url")
+    var title = u.split(/[/?#]/).filter(Boolean).pop() || host
+    try { title = decodeURIComponent(title.replace(/\+/g, " ")) } catch (e) {}
+    sourceActionError = ""
+    directUrl = u
+    return downloadCurrent({ hit: { title: title, path: u, provider: provider,
+      video: provider === "youtube" || MediaModel.pathHasVideoExt(u), stream: false } })
   }
 
   function handleDownloadEvent(line) {
@@ -4439,16 +4506,20 @@ Item {
           var data = JSON.parse(String(text || ""))
           if (data && data.provider) root.cliampActiveProvider = String(data.provider)
           if (data && data.path) root.playPathOverride = String(data.path)
-          if (data && data.ok === false && data.error)
+          if (data && data.ok === false && data.error) {
+            root.sourceActionError = String(data.error)
             root.showOsd(String(data.error), "media")
+          } else if (data && data.ok) root.sourceActionError = ""
         } catch (e) {}
         cliampRefreshTimer.interval = 400
         cliampRefreshTimer.restart()
       }
     }
     onExited: function(exitCode) {
-      if (exitCode !== 0)
+      if (exitCode !== 0 && !root.sourceActionError) {
+        root.sourceActionError = "Playback failed. The source may require sign-in or may be unavailable."
         root.showOsd("Play failed", "media")
+      }
       cliampRefreshTimer.interval = 400
       cliampRefreshTimer.restart()
     }

@@ -53,8 +53,12 @@ def call(op, params, timeout=12):
   try:
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return json.loads(p.stdout or "{}")
-  except Exception:
-    return {}
+  except subprocess.TimeoutExpired:
+    return {"ok": False, "error": "Source timed out"}
+  except FileNotFoundError:
+    return {"ok": False, "error": "cliamp is not installed"}
+  except Exception as e:
+    return {"ok": False, "error": str(e)[:120] or "Source request failed"}
 
 def configured_searchable():
   d = call("provider.list", {})
@@ -116,7 +120,10 @@ def normalize_tracks(prov, raw):
       "track": t,
     })
   ok = j.get("state") == "succeeded" or bool(r.get("ok", False))
-  return out, ok and not j.get("error"), j.get("error")
+  error = j.get("error") or raw.get("error") or r.get("error")
+  if not ok and not error:
+    error = "Provider returned no results"
+  return out, ok and not error, error
 
 def search_one(prov):
   raw = call("provider.search", {
@@ -185,6 +192,7 @@ print(json.dumps({
       "label": (by_prov.get(p) or {}).get("label") or LABELS.get(p, p),
       "count": (by_prov.get(p) or {}).get("count") or 0,
       "ok": bool((by_prov.get(p) or {}).get("ok")),
+      "error": str((by_prov.get(p) or {}).get("error") or ""),
     }
     for p in providers
   ],

@@ -315,6 +315,9 @@ function normalizeHit(hit) {
     path: String(hit.path || ""),
     artUrl: String(hit.artUrl || ""),
     stream: !!hit.stream,
+    video: hit.video === true || hit.isVideo === true,
+    isVideo: hit.isVideo === true,
+    ffprobeVideo: hit.ffprobeVideo,
     feed: !!hit.feed,
     kind: String(hit.kind || ""),
     albumId: String(hit.albumId || ""),
@@ -963,12 +966,14 @@ function parseCliampSearchResults(text) {
     for (var d = 0; d < defs.length; d++) labelMap[defs[d].id] = defs[d].label
     var hitLabels = hits.map(function(h) { return labelMap[h] || h })
     var tracks = Array.isArray(data.tracks) ? data.tracks : []
+    var failures = Array.isArray(data.perProvider) ? data.perProvider.filter(function(p) { return p && p.ok === false }) : []
+    var error = tracks.length === 0 ? String(data.error || failures.map(function(p) { return String(p.label || p.provider || "Source") + ": " + String(p.error || "unavailable") }).join(" · ")) : ""
     return {
       ok: true,
       provider: String(data.provider || "all"),
       total: Number(data.total) || tracks.length,
       tracks: tracks,
-      error: tracks.length === 0 ? String(data.error || "") : "",
+      error: error,
       hitProviders: hitLabels
     }
   } catch (e) {
@@ -1060,6 +1065,7 @@ function hitIsVideo(hit) {
   // YouTube watch / provider is video-capable
   if (prov === "youtube" || kind === "youtube" || isYoutubeUrl(path)) return true
   if (pathHasVideoExt(path)) return true
+  if (/\.(m3u8|mpd)(\?|$)/i.test(path)) return true
   return false
 }
 

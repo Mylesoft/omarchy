@@ -87,6 +87,8 @@ Panel {
   readonly property var searchResults: mediaService ? mediaService.searchResults : []
   readonly property bool searchBusy: mediaService ? !!mediaService.searchBusy : false
   readonly property string searchError: mediaService ? (mediaService.searchError || "") : ""
+  readonly property bool downloadChoicePending: mediaService ? !!mediaService.downloadChoicePending : false
+  readonly property string sourceActionError: mediaService ? String(mediaService.sourceActionError || "") : ""
   readonly property string searchQuery: mediaService ? (mediaService.searchQuery || "") : ""
   readonly property var searchSuggestions: mediaService ? (mediaService.searchSuggestions || []) : []
   readonly property bool downloadBusy: mediaService ? !!mediaService.downloadBusy : false
@@ -739,6 +741,68 @@ Panel {
                     }
                   }
                 }
+              }
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+              TextField {
+                id: directUrlField
+                width: parent.width - directUrlActions.implicitWidth - Style.space(8)
+                placeholderText: "Paste a URL to play or download"
+                text: root.mediaService ? String(root.mediaService.directUrl || "") : ""
+                selectByMouse: true
+                onAccepted: if (root.mediaService) root.mediaService.playDirectUrl(text)
+              }
+              Row {
+                id: directUrlActions
+                spacing: Style.space(6)
+                Button {
+                  text: "Play URL"
+                  foreground: root.foreground
+                  onClicked: if (root.mediaService) root.mediaService.playDirectUrl(directUrlField.text)
+                }
+                Button {
+                  text: "Download"
+                  foreground: root.foreground
+                  onClicked: if (root.mediaService) root.mediaService.downloadDirectUrl(directUrlField.text)
+                }
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.sourceActionError !== ""
+              text: root.sourceActionError
+              color: root.dim
+              wrapMode: Text.WordWrap
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            BorderSurface {
+              width: parent.width
+              visible: root.downloadChoicePending
+              height: downloadChoiceRow.implicitHeight + Style.space(20)
+              radius: Style.space(12)
+              color: Util.alpha(Color.accent, 0.10)
+              borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
+              Row {
+                id: downloadChoiceRow
+                anchors.fill: parent
+                anchors.margins: Style.space(10)
+                spacing: Style.space(8)
+                Text {
+                  text: "Download as"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                Button { text: "Video"; foreground: root.foreground; onClicked: root.mediaService.chooseDownloadFormat("video") }
+                Button { text: "MP3 audio"; foreground: root.foreground; onClicked: root.mediaService.chooseDownloadFormat("mp3") }
+                Button { text: "Cancel"; foreground: root.dim; onClicked: root.mediaService.cancelDownloadChoice() }
               }
             }
           }
@@ -3762,6 +3826,18 @@ Panel {
                           root.mediaService.queueSearchResult(root.contextHit)
                         root.clearHitContext()
                         root.armHoldOpen(1500)
+                      }
+                    }
+
+                    Button {
+                      text: "Download"
+                      foreground: root.foreground
+                      horizontalPadding: Style.spacing.controlPaddingX
+                      verticalPadding: Style.spacing.controlPaddingY
+                      onClicked: {
+                        if (root.mediaService && root.contextHit)
+                          root.mediaService.downloadCurrent({ hit: root.contextHit })
+                        root.clearHitContext()
                       }
                     }
 
