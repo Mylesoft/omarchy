@@ -808,7 +808,21 @@ Item {
   }
 
   function activeHubDef() {
-    return MediaModel.hubDefById(activeHubId)
+    var hub = MediaModel.hubDefById(activeHubId)
+    if (!hub || !hub.isCliampProvider) return hub
+    var copy = Object.assign({}, hub)
+    copy.configured = !root.hubNeedsSetup(activeHubId)
+    return copy
+  }
+
+  function hubNeedsSetup(id) {
+    if (String(id || "") === "local") return false
+    var hub = MediaModel.hubDefById(id)
+    if (!hub || !hub.isCliampProvider) return false
+    for (var i = 0; i < cliampConfiguredProviders.length; i++) {
+      if (cliampConfiguredProviders[i] && cliampConfiguredProviders[i].key === id) return false
+    }
+    return true
   }
 
   // Defer model replacement so in-flight clicks aren't dropped onto the
@@ -851,6 +865,7 @@ Item {
         appSync: !!hub.appSync,
         appSearch: !!hub.appSearch,
         isCliampProvider: !!hub.isCliampProvider,
+        configured: !hub.isCliampProvider || !!online || hub.id === "local",
         isLibraryHub: !!hub.isLibraryHub,
         isDownloadsHub: !!hub.isDownloadsHub,
         isRecentsHub: !!hub.isRecentsHub || hub.id === "recents",
@@ -885,7 +900,7 @@ Item {
       var playing = usingCliamp && !!cliamp.playing && cliampActiveProvider === id
       var detail = hub.blurb
       if (playing) detail = cliamp.title || "Playing"
-      else if (!online) detail = "Not configured — click to set up"
+      else if (!online && id !== "local") detail = "Needs setup · select for details"
       else if (hub.id === "local" || hub.isLocalHub) detail = "Browse local files"
       else detail = "Search " + hub.label
       pushEntry(hub, online, playing, detail)
@@ -1033,17 +1048,16 @@ Item {
     var hub = MediaModel.hubDefById(id)
     if (!hub) return false
 
-    // Unconfigured cliamp provider → setup wizard (same as provider rail).
+    // Selecting an unconfigured source stays in this drawer. Users can choose
+    // to open the cliamp wizard from the source detail card when ready.
     if (hub.isCliampProvider) {
-      var online = false
-      for (var c = 0; c < cliampConfiguredProviders.length; c++) {
-        if (cliampConfiguredProviders[c] && cliampConfiguredProviders[c].key === hub.id) {
-          online = true
-          break
-        }
-      }
-      if (!online) {
-        openCliampSetup()
+      if (hubNeedsSetup(hub.id)) {
+        activeHubId = hub.id
+        pendingHubSearchRestore = ""
+        searchBusy = false
+        searchResults = []
+        searchError = "This source needs cliamp setup before it can search or play."
+        scheduleHubRebuild()
         return true
       }
     }
@@ -1146,10 +1160,9 @@ Item {
       if (entries[i].id === id) { entry = entries[i]; break }
     }
 
-    // Unconfigured → open setup wizard.
-    if (entry && !entry.online) {
-      openCliampSetup()
-      return true
+    // Do not launch a terminal unexpectedly from a source-selection action.
+    if (entry && !entry.online && id !== "local") {
+      return openHub(id)
     }
 
     // Ensure cliamp is the active exclusive source.
@@ -5072,7 +5085,7 @@ Item {
       eqPreset: root.eqPreset,
       volumeMode: root.volumeMode,
       extrasTab: root.extrasTabSetting,
-      pluginVersion: "1.9.0",
+      pluginVersion: "1.11.0",
       canQueueCurrent: !!root.canQueueCurrent,
       queueTotal: root.queueTotal,
       queueIndex: root.queueIndex,

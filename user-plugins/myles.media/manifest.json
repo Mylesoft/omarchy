@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "myles.media",
   "name": "Media",
-  "version": "1.10.0",
+  "version": "1.11.0",
   "author": "Myles",
   "description": "Media hubs, video PiP, pasted URL playback, video or MP3 downloads, and casting",
   "kinds": [
