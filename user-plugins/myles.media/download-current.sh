@@ -166,6 +166,9 @@ provider = str(hit.get("provider") or "").strip().lower()
 identity = str(hit.get("identity") or "").strip().lower()
 search_hint = str(hit.get("searchHint") or "").strip()
 record_requested = hit.get("recordSeconds") is not None or hit.get("recordMinutes") is not None
+download_format = str(hit.get("downloadFormat") or "mp3").lower()
+if download_format not in ("mp3", "video"):
+  download_format = "mp3"
 
 outdir = Path.home() / "Downloads" / "Media"
 outdir.mkdir(parents=True, exist_ok=True)
@@ -253,6 +256,7 @@ def done(ok, mode, dest="", error=""):
     "sizeLabel": fmt_size(Path(dest).stat().st_size) if dest and Path(dest).is_file() else "",
     "addedAt": datetime.now(timezone.utc).isoformat(),
     "mode": mode,
+    "format": download_format,
     "error": error or "",
   }
   if entry["path"] or error:
@@ -287,17 +291,18 @@ if record_requested:
   dl_id = "record:" + capture_stamp + ":" + base[:40]
 else:
   stem = outdir / base
-  dl_id = "dl:" + base[:48]
+  dl_id = "dl:" + download_format + ":" + base[:42]
 
 
 def already_have():
+  expected = (".mp3",) if download_format == "mp3" else (".mp4", ".mkv", ".webm", ".mov", ".m4v")
   for p in outdir.glob(base + ".*"):
     if not p.is_file():
       continue
     name = p.name.lower()
     if name.endswith((".part", ".ytdl", ".temp")):
       continue
-    if p.stat().st_size > 1024:
+    if p.suffix.lower() in expected and p.stat().st_size > 1024:
       return p
   return None
 
@@ -372,7 +377,7 @@ upsert_reg({
   "id": dl_id,
   "title": title,
   "artist": artist,
-  "path": str(stem) + ".mp3",
+  "path": str(stem) + (".mp3" if download_format == "mp3" else ".mp4"),
   "provider": provider,
   "sourcePath": path,
   "searchHint": search_hint,
@@ -383,23 +388,33 @@ upsert_reg({
   "sizeLabel": "",
   "addedAt": datetime.now(timezone.utc).isoformat(),
   "mode": mode,
+  "format": download_format,
   "error": "",
 })
 progress(1, "Starting…")
-# Warn for likely huge video downloads before convert.
-if mode in ("youtube", "ytsearch"):
-  progress(2, "Audio-only convert (mp3)…")
+# Local file → copy video, or extract the requested MP3 audio.
+if path.startswith("/") and Path(path).is_file():
+  source = Path(path)
+  if download_format == "video":
+    dest = stem.with_suffix(source.suffix or ".mp4")
+    progress(10, "Copying video…")
+    shutil.copy2(source, dest)
+    progress(100, "Done")
+    done(True, "copy-video", dest)
+  ffmpeg = shutil.which("ffmpeg")
+  if not ffmpeg:
+    done(False, "local-audio", error="ffmpeg-not-installed")
+  dest = stem.with_suffix(".mp3")
+  p = subprocess.run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-vn", "-c:a", "libmp3lame", "-q:a", "3", str(dest)], capture_output=True, text=True)
+  if p.returncode == 0 and dest.exists() and dest.stat().st_size > 1024:
+    done(True, "local-audio", dest)
+  dest.unlink(missing_ok=True)
+  done(False, "local-audio", error=(p.stderr or "audio-extract-failed")[-220:])
 
 # Local file → copy
-if path.startswith("/") and Path(path).is_file():
-  dest = stem.with_suffix(Path(path).suffix or ".bin")
-  progress(10, "Copying…")
-  shutil.copy2(path, dest)
-  progress(100, "Done")
-  done(True, "copy", dest)
-
 # Live radio vs finite episode/track files.
 looks_finite = bool(re.search(r"\.(mp3|aac|ogg|flac|m4a|wav)(\?|$)", url, re.I))
+looks_video_file = bool(re.search(r"\.(mp4|m4v|mov|mkv|webm|avi)(\?|$)", url, re.I))
 live_hint = any(
   x in url.lower()
   for x in ("/stream", "icecast", "streamguys", "cdnstream", ".m3u8", "radio.garden")
@@ -458,7 +473,35 @@ if mode == "url" and url.startswith("http") and is_live:
     stderr = stderr.decode("utf-8", "replace")
   done(False, "stream-record", error=(stderr.strip() or "stream-capture-failed")[:220])
 
+if mode == "url" and url.startswith("http") and download_format == "video" and looks_video_file:
+  extm = re.search(r"\.(mp4|m4v|mov|mkv|webm|avi)(\?|$)", url, re.I)
+  ext = "." + extm.group(1).lower() if extm else ".mp4"
+  dest = stem.with_suffix(ext)
+  partial = Path(str(dest) + ".part")
+  partial.unlink(missing_ok=True)
+  progress(5, "Downloading video…")
+  p = subprocess.run(["curl", "-fL", "--max-time", "1800", "-A", "Mozilla/5.0", "-o", str(partial), url], capture_output=True, text=True)
+  if p.returncode == 0 and partial.exists() and partial.stat().st_size > 8000:
+    partial.replace(dest)
+    done(True, "http-video", dest)
+  partial.unlink(missing_ok=True)
+  done(False, "http-video", error=(p.stderr or "http-video-download-failed")[-220:])
+
 if mode == "url" and url.startswith("http") and looks_finite and "youtube" not in url.lower():
+  if download_format == "mp3" and not url.lower().split("?",1)[0].endswith(".mp3"):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+      done(False, "http-audio", error="ffmpeg-not-installed")
+    rawdest = stem.with_suffix(".source")
+    rawpart = Path(str(rawdest) + ".part")
+    p = subprocess.run(["curl", "-fL", "--max-time", "600", "-A", "Mozilla/5.0", "-o", str(rawpart), url], capture_output=True, text=True)
+    if p.returncode != 0 or not rawpart.exists() or rawpart.stat().st_size <= 1024:
+      rawpart.unlink(missing_ok=True)
+      done(False, "http-audio", error=(p.stderr or "http-download-failed")[-220:])
+    p = subprocess.run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(rawpart), "-vn", "-c:a", "libmp3lame", "-q:a", "3", str(stem.with_suffix(".mp3"))], capture_output=True, text=True)
+    rawpart.unlink(missing_ok=True)
+    if p.returncode == 0 and stem.with_suffix(".mp3").exists(): done(True, "http-audio", stem.with_suffix(".mp3"))
+    done(False, "http-audio", error=(p.stderr or "audio-convert-failed")[-220:])
   ext = ".mp3"
   m = re.search(r"\.(mp3|aac|ogg|flac|m4a|wav)(\?|$)", url, re.I)
   if m:
@@ -504,18 +547,12 @@ if not shutil.which("yt-dlp"):
   done(False, mode, error="yt-dlp-missing")
 
 outtmpl = str(stem) + ".%(ext)s"
-cmd = [
-  "yt-dlp",
-  "-f", "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=webm]/bestaudio/best",
-  "-x", "--audio-format", "mp3", "--audio-quality", "0",
-  "--extractor-args", "youtube:player_client=web,android,ios",
-  "--no-playlist",
-  "--newline",
-  "-o", outtmpl,
-  "--no-warnings",
-  "--no-keep-video",
-  url,
-]
+if download_format == "video":
+  progress(2, "Video + audio download…")
+  cmd = ["yt-dlp", "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best", "--merge-output-format", "mp4", "--extractor-args", "youtube:player_client=web,android,ios", "--no-playlist", "--newline", "-o", outtmpl, "--no-warnings", url]
+else:
+  progress(2, "Audio-only convert (mp3)…")
+  cmd = ["yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=webm]/bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "0", "--extractor-args", "youtube:player_client=web,android,ios", "--no-playlist", "--newline", "-o", outtmpl, "--no-warnings", "--no-keep-video", url]
 progress(3, "Fetching…")
 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 last_pct = 3
