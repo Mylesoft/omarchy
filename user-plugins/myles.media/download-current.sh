@@ -355,15 +355,26 @@ if existing:
   progress(100, "Already downloaded")
   done(True, "exists", existing)
 
-# Dedupe by normalized title+artist against registry / folder.
+# Dedupe by normalized title+artist, but never substitute audio for video or
+# video for audio. Older registry rows may not have a format field, so also
+# verify the actual filename extension.
+video_extensions = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+def path_matches_requested_format(candidate):
+  suffix = Path(str(candidate)).suffix.lower()
+  return suffix == ".mp3" if download_format == "mp3" else suffix in video_extensions
+
 norm = f"{artist} {title}".strip().lower()
 for it in load_reg():
   if not isinstance(it, dict):
     continue
   other = f"{it.get('artist','')} {it.get('title','')}".strip().lower()
-  if norm and other == norm and it.get("status") == "done" and it.get("path") and Path(str(it["path"])).is_file():
+  candidate = Path(str(it.get("path") or ""))
+  recorded_format = str(it.get("format") or "").lower()
+  if (norm and other == norm and it.get("status") == "done"
+      and candidate.is_file() and path_matches_requested_format(candidate)
+      and recorded_format in ("", download_format)):
     progress(100, "Already in library")
-    done(True, "dedupe-reg", Path(str(it["path"])))
+    done(True, "dedupe-reg", candidate)
 
 # PID file so the panel can cancel (process group — never pkill -f yt-dlp).
 try:
