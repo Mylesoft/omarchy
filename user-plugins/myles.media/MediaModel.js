@@ -915,41 +915,34 @@ function parseCliampProviderList(text) {
 }
 
 function buildCliampProviderEntries(configured, activeProvider) {
-  var configuredMap = {}
   var configuredList = Array.isArray(configured) ? configured : []
-  for (var i = 0; i < configuredList.length; i++) {
-    var c = configuredList[i]
-    if (c && c.key) configuredMap[c.key] = c
-  }
-
   var defs = cliampProviderDefs()
   var seen = {}
   var entries = []
 
-  function pushEntry(id, label, icon, online) {
+  function pushEntry(id, label, icon) {
     if (!id || seen[id]) return
     seen[id] = true
-    var conf = configuredMap[id]
     entries.push({
       id: id,
       label: label || id,
       icon: icon || "󰎆",
-      online: !!online,
-      searchable: !!(conf && conf.searchable !== false) || !!online,
+      online: true,
+      searchable: true,
       selected: String(activeProvider || "") === id,
-      detail: online ? (String(activeProvider || "") === id ? "Active" : "Ready") : "Not configured — click to set up"
+      detail: String(activeProvider || "") === id ? "Active" : "Ready"
     })
   }
 
-  for (var d = 0; d < defs.length; d++) {
-    var def = defs[d]
-    pushEntry(def.id, def.label, def.icon, !!configuredMap[def.id])
-  }
-
   for (var k = 0; k < configuredList.length; k++) {
-    var extra = configuredList[k]
-    if (!extra || !extra.key || seen[extra.key]) continue
-    pushEntry(extra.key, extra.name || extra.key, "󰎆", true)
+    var conf = configuredList[k]
+    if (!conf || !conf.key) continue
+    var label = conf.name || conf.key
+    var icon = "󰎆"
+    for (var d = 0; d < defs.length; d++) {
+      if (defs[d].id === conf.key) { label = defs[d].label; icon = defs[d].icon; break }
+    }
+    pushEntry(conf.key, label, icon)
   }
 
   return entries
@@ -1050,6 +1043,15 @@ function isYoutubeUrl(path) {
     && u.indexOf("googlevideo.com") === -1
 }
 
+function isFacebookVideoUrl(path) {
+  var u = String(path || "").trim().toLowerCase()
+  if (/(?:^|\/\/)fb\.watch\//.test(u)) return true
+  var m = u.match(/^(?:https?:\/\/)?(?:www\.|m\.|web\.)?facebook\.com\/([^?#]*)/)
+  if (!m) return false
+  var p = "/" + m[1]
+  return /^\/(?:watch\/?|video\.php$|share\/[vr]\/|reel\/)/.test(p) || /\/videos\//.test(p)
+}
+
 function hitIsVideo(hit) {
   if (!hit || typeof hit !== "object") return false
   if (hit.video === true || hit.isVideo === true || hit.ffprobeVideo === true) return true
@@ -1064,6 +1066,7 @@ function hitIsVideo(hit) {
   if (path.indexOf("spotify:") === 0) return false
   // YouTube watch / provider is video-capable
   if (prov === "youtube" || kind === "youtube" || isYoutubeUrl(path)) return true
+  if (prov === "facebook" || isFacebookVideoUrl(path)) return true
   if (pathHasVideoExt(path)) return true
   if (/\.(m3u8|mpd)(\?|$)/i.test(path)) return true
   return false
@@ -1170,6 +1173,7 @@ if (typeof module !== "undefined") {
     videoExtensions: videoExtensions,
     pathHasVideoExt: pathHasVideoExt,
     isYoutubeUrl: isYoutubeUrl,
+    isFacebookVideoUrl: isFacebookVideoUrl,
     hitIsVideo: hitIsVideo,
     emptyMpvSnapshot: emptyMpvSnapshot,
     parseMpvStatus: parseMpvStatus,

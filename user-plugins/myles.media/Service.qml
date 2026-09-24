@@ -888,19 +888,14 @@ Item {
       if (cp && cp.key) configuredMap[cp.key] = cp
     }
 
-    var appOwned = {}
     var appHubsPre = MediaModel.mediaHubDefs()
-    for (var ap = 0; ap < appHubsPre.length; ap++) {
-      if (appHubsPre[ap] && appHubsPre[ap].id)
-        appOwned[appHubsPre[ap].id] = true
-    }
 
     function addProvider(id, label, icon, online) {
+      if (!online && id !== "local") return
       var hub = MediaModel.cliampProviderHubDef(id, label, icon)
       var playing = usingCliamp && !!cliamp.playing && cliampActiveProvider === id
       var detail = hub.blurb
       if (playing) detail = cliamp.title || "Playing"
-      else if (!online && id !== "local") detail = "Needs setup · select for details"
       else if (hub.id === "local" || hub.isLocalHub) detail = "Browse local files"
       else detail = "Search " + hub.label
       pushEntry(hub, online, playing, detail)
@@ -1010,11 +1005,14 @@ Item {
       addAppHub(appHubsPre[h])
     }
 
-    // 4) Rest of cliamp roster (skip unconfigured app-owned twins).
-    for (var j = 0; j < defs.length; j++) {
-      if (seen[defs[j].id]) continue
-      if (appOwned[defs[j].id] && !configuredMap[defs[j].id]) continue
-      addProvider(defs[j].id, defs[j].label, defs[j].icon, !!configuredMap[defs[j].id])
+    // Unconfigured providers stay out of every source list and drawer.
+    var activeDef = MediaModel.hubDefById(activeHubId)
+    if (activeDef && activeDef.isCliampProvider && hubNeedsSetup(activeHubId)) {
+      activeHubId = ""
+      searchQuery = ""
+      searchResults = []
+      searchBusy = false
+      searchError = ""
     }
 
     hubEntries = entries
@@ -1048,19 +1046,7 @@ Item {
     var hub = MediaModel.hubDefById(id)
     if (!hub) return false
 
-    // Selecting an unconfigured source stays in this drawer. Users can choose
-    // to open the cliamp wizard from the source detail card when ready.
-    if (hub.isCliampProvider) {
-      if (hubNeedsSetup(hub.id)) {
-        activeHubId = hub.id
-        pendingHubSearchRestore = ""
-        searchBusy = false
-        searchResults = []
-        searchError = "This source needs cliamp setup before it can search or play."
-        scheduleHubRebuild()
-        return true
-      }
-    }
+    if (hub.isCliampProvider && hubNeedsSetup(hub.id)) return false
 
     activeHubId = hub.id
 
@@ -1153,6 +1139,7 @@ Item {
   function selectCliampProvider(providerId) {
     var id = String(providerId || "").toLowerCase()
     if (!id) return false
+    if (hubNeedsSetup(id)) return false
 
     var entries = providerEntries
     var entry = null
@@ -1160,10 +1147,7 @@ Item {
       if (entries[i].id === id) { entry = entries[i]; break }
     }
 
-    // Do not launch a terminal unexpectedly from a source-selection action.
-    if (entry && !entry.online && id !== "local") {
-      return openHub(id)
-    }
+    if (!entry) return false
 
     // Ensure cliamp is the active exclusive source.
     if (!cliamp.online) {
@@ -2200,14 +2184,15 @@ Item {
     var u = String(rawUrl || "").trim()
     if (!/^https?:\/\//i.test(u)) { sourceActionError = "Enter a complete http(s) URL"; return false }
     var host = u.replace(/^https?:\/\//i, "").split(/[/?#]/)[0]
+    var facebook = MediaModel.isFacebookVideoUrl(u)
     var provider = /(^|\.)youtu\.be$|(^|\.)youtube\.com$/i.test(host) ? "youtube"
-      : (/radio\.garden$/i.test(host) ? "radio-garden" : "url")
+      : (facebook ? "facebook" : (/radio\.garden$/i.test(host) ? "radio-garden" : "url"))
     var title = u.split(/[/?#]/).filter(Boolean).pop() || host
     try { title = decodeURIComponent(title.replace(/\+/g, " ")) } catch (e) {}
     sourceActionError = ""
     directUrl = u
     var ok = playSearchResult({ title: title, path: u, provider: provider,
-      video: provider === "youtube" || MediaModel.pathHasVideoExt(u), stream: /\.(m3u8|mpd)(\?|$)/i.test(u) })
+      video: provider === "youtube" || facebook || MediaModel.pathHasVideoExt(u), stream: /\.(m3u8|mpd)(\?|$)/i.test(u) })
     if (!ok) sourceActionError = "Could not start this URL. Check that it is public and playable."
     return ok
   }
@@ -2216,14 +2201,15 @@ Item {
     var u = String(rawUrl || "").trim()
     if (!/^https?:\/\//i.test(u)) { sourceActionError = "Enter a complete http(s) URL"; return false }
     var host = u.replace(/^https?:\/\//i, "").split(/[/?#]/)[0]
+    var facebook = MediaModel.isFacebookVideoUrl(u)
     var provider = /(^|\.)youtu\.be$|(^|\.)youtube\.com$/i.test(host) ? "youtube"
-      : (/radio\.garden$/i.test(host) ? "radio-garden" : "url")
+      : (facebook ? "facebook" : (/radio\.garden$/i.test(host) ? "radio-garden" : "url"))
     var title = u.split(/[/?#]/).filter(Boolean).pop() || host
     try { title = decodeURIComponent(title.replace(/\+/g, " ")) } catch (e) {}
     sourceActionError = ""
     directUrl = u
     return downloadCurrent({ hit: { title: title, path: u, provider: provider,
-      video: provider === "youtube" || MediaModel.pathHasVideoExt(u), stream: false } })
+      video: provider === "youtube" || facebook || MediaModel.pathHasVideoExt(u), stream: false } })
   }
 
   function handleDownloadEvent(line) {
