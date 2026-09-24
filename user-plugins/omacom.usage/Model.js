@@ -102,7 +102,7 @@ function history(days, todayKey, todaySeconds, count) {
     var seconds = 0
     if (key === todayKey) seconds = todaySeconds
     else if (days && days[key]) seconds = days[key]
-    out.push({ key: key, label: dayLabel(key), seconds: seconds })
+    out.push({ key: key, label: count > 14 ? String(d.getDate()) : dayLabel(key), seconds: seconds })
   }
   return out
 }
@@ -182,6 +182,20 @@ function topApps(appSeconds, count) {
   }
   out.sort(function(a, b) { return b.seconds - a.seconds })
   return out.slice(0, max)
+}
+
+
+// Default app grouping; per-app assignments can override these categories.
+function appCategory(appId) {
+  var id = String(appId || "").toLowerCase()
+  if (id.indexOf("chrome") === 0 || id.indexOf("chromium") === 0 || id.indexOf("firefox") >= 0
+    || id.indexOf("brave") >= 0 || id.indexOf("browser") >= 0 || id === "zen") return "browsing"
+  if (id.indexOf("signal") >= 0 || id.indexOf("discord") >= 0 || id.indexOf("telegram") >= 0
+    || id.indexOf("whatsapp") >= 0 || id.indexOf("slack") >= 0 || id.indexOf("teams") >= 0) return "communication"
+  if (id.indexOf("code") >= 0 || id.indexOf("cursor") >= 0 || id.indexOf("jetbrains") >= 0
+    || id.indexOf("terminal") >= 0 || id === "foot" || id === "kitty" || id === "alacritty"
+    || id.indexOf("opencode") >= 0 || id.indexOf("claude") >= 0) return "work"
+  return "other"
 }
 
 function topAppsMax(entries) {
@@ -286,8 +300,9 @@ function weekCompare(days, todayKey, todaySeconds) {
 function goalEta(activeToday, goalSeconds, nowMs) {
   if (Number(activeToday) >= Number(goalSeconds)) return "done"
   var frac = dayFraction(nowMs)
-  if (frac <= 0.05) return ""
+  if (frac <= 0.05 || Number(activeToday) <= 0) return ""
   var pacePerHour = Number(activeToday) / frac
+  if (!(pacePerHour > 0) || !isFinite(pacePerHour)) return ""
   var missing = Number(goalSeconds) - Number(activeToday)
   var etaMs = nowMs + (missing / pacePerHour) * 3600 * 1000
   var d = new Date(etaMs)
@@ -295,11 +310,15 @@ function goalEta(activeToday, goalSeconds, nowMs) {
   return pad2(d.getHours()) + ":" + pad2(d.getMinutes())
 }
 
-// Aggregate per-app seconds across the stored day-map and today's accumulator.
-function topAppsAcross(appDays, appSeconds, todayKey, count) {
+// Aggregate per-app seconds across a selected trailing range and today's accumulator.
+function topAppsAcross(appDays, appSeconds, todayKey, count, rangeDays) {
   var agg = {}
+  var today = parseKey(todayKey)
+  if (!isFinite(today.getTime())) today = new Date()
+  var span = Math.max(1, Math.min(30, Number(rangeDays) || 7))
+  var cutoff = dayKey(new Date(today.getFullYear(), today.getMonth(), today.getDate() - span + 1))
   for (var dk in appDays) {
-    if (!appDays.hasOwnProperty(dk)) continue
+    if (!appDays.hasOwnProperty(dk) || dk < cutoff || dk >= todayKey) continue
     var day = appDays[dk]
     if (!day || typeof day !== "object") continue
     for (var id in day) {
