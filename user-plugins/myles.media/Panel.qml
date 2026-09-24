@@ -51,6 +51,7 @@ Panel {
   readonly property bool hubOpen: mediaService ? !!mediaService.hubOpen : false
   readonly property string activeHubId: mediaService ? (mediaService.activeHubId || "") : ""
   readonly property var activeHub: mediaService ? mediaService.activeHub : null
+  readonly property bool activeSourceNeedsSetup: !!(activeHub && activeHub.isCliampProvider && !activeHub.configured)
   readonly property bool hasPlayer: mediaService ? !!mediaService.hasPlayer : false
   readonly property bool isPlaying: mediaService ? !!mediaService.isPlaying : false
   readonly property string title: mediaService && mediaService.hasPlayer ? mediaService.title : "No media"
@@ -147,7 +148,7 @@ Panel {
   readonly property bool showLibraryPane: root.isLibraryHub || (root.hubOpen && root.hubPane === "favourites" && !root.isDownloadsHub && !root.isRecentsHub)
   readonly property bool showDownloadsPane: root.isDownloadsHub || (root.hubOpen && root.hubPane === "downloads")
   readonly property bool showRecentsPane: root.isRecentsHub || (root.hubOpen && root.hubPane === "recents")
-  readonly property bool showSearchPane: root.searchAvailable && root.hubPane === "search" && !root.isLibraryHub && !root.isDownloadsHub && !root.isRecentsHub
+  readonly property bool showSearchPane: root.searchAvailable && root.hubPane === "search" && !root.isLibraryHub && !root.isDownloadsHub && !root.isRecentsHub && !root.activeSourceNeedsSetup
   readonly property var libraryItems: {
     var _t = mediaService ? mediaService.libraryTick : 0
     if (!mediaService) return []
@@ -2336,6 +2337,36 @@ Panel {
               wrapMode: Text.WordWrap
             }
 
+            BorderSurface {
+              width: parent.width
+              visible: root.activeSourceNeedsSetup
+              height: providerSetupInner.implicitHeight + Style.space(20)
+              radius: Style.spacing.labelGap
+              color: Util.alpha(Color.accent, 0.08)
+              borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
+              Column {
+                id: providerSetupInner
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.margins: Style.space(14)
+                spacing: Style.space(8)
+                Text {
+                  width: parent.width
+                  text: (root.activeHub ? root.activeHub.label : "This source") + " is not configured yet. Configure it in cliamp to connect its account or server."
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  wrapMode: Text.WordWrap
+                }
+                Button {
+                  text: "Configure source…"
+                  foreground: root.foreground
+                  onClicked: if (root.mediaService) root.mediaService.openCliampSetup()
+                }
+              }
+            }
+
             // App-sync only (mpv) — Spotify/Radio Garden use the search field below
             BorderSurface {
               width: parent.width
@@ -2406,7 +2437,7 @@ Panel {
             Row {
               width: parent.width
               spacing: Style.space(8)
-              visible: root.searchAvailable && !root.isLibraryHub && !root.isDownloadsHub
+              visible: root.searchAvailable && !root.isLibraryHub && !root.isDownloadsHub && !root.activeSourceNeedsSetup
 
               BorderSurface {
                 height: Style.space(28)
