@@ -1052,6 +1052,28 @@ function isFacebookVideoUrl(path) {
   return /^\/(?:watch\/?|video\.php$|share\/[vr]\/|reel\/)/.test(p) || /\/videos\//.test(p)
 }
 
+function isTikTokVideoUrl(path) {
+  var u = String(path || "").trim().toLowerCase()
+  return /^(?:https?:\/\/)?(?:www\.|m\.)?(?:tiktok\.com\/@[^/]+\/video\/|(?:vm|vt)\.tiktok\.com\/)/.test(u)
+}
+
+function isXVideoUrl(path) {
+  var u = String(path || "").trim().toLowerCase()
+  return /^(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com)\/.+\/(?:status|i\/videos)\//.test(u)
+}
+
+function mediaProviderForUrl(path) {
+  var u = String(path || "").trim()
+  var hostMatch = u.match(/^https?:\/\/([^/:?#]+)/i)
+  var host = hostMatch ? hostMatch[1].toLowerCase().replace(/^www\./, "") : ""
+  if (/(^|\.)youtube\.com$/.test(host) || host === "youtu.be" || /(^|\.)youtube-nocookie\.com$/.test(host)) return "youtube"
+  if (/(^|\.)facebook\.com$/.test(host) || host === "fb.watch") return "facebook"
+  if (/(^|\.)tiktok\.com$/.test(host)) return "tiktok"
+  if (host === "x.com" || host === "twitter.com" || /(^|\.)x\.com$/.test(host)) return "x"
+  if (/(^|\.)radio\.garden$/.test(host)) return "radio-garden"
+  return "url"
+}
+
 function hitIsVideo(hit) {
   if (!hit || typeof hit !== "object") return false
   if (hit.video === true || hit.isVideo === true || hit.ffprobeVideo === true) return true
@@ -1067,6 +1089,8 @@ function hitIsVideo(hit) {
   // YouTube watch / provider is video-capable
   if (prov === "youtube" || kind === "youtube" || isYoutubeUrl(path)) return true
   if (prov === "facebook" || isFacebookVideoUrl(path)) return true
+  if (prov === "tiktok" || isTikTokVideoUrl(path)) return true
+  if (prov === "x" || prov === "twitter" || isXVideoUrl(path)) return true
   if (pathHasVideoExt(path)) return true
   if (/\.(m3u8|mpd)(\?|$)/i.test(path)) return true
   return false
@@ -1174,6 +1198,9 @@ if (typeof module !== "undefined") {
     pathHasVideoExt: pathHasVideoExt,
     isYoutubeUrl: isYoutubeUrl,
     isFacebookVideoUrl: isFacebookVideoUrl,
+    isTikTokVideoUrl: isTikTokVideoUrl,
+    isXVideoUrl: isXVideoUrl,
+    mediaProviderForUrl: mediaProviderForUrl,
     hitIsVideo: hitIsVideo,
     emptyMpvSnapshot: emptyMpvSnapshot,
     parseMpvStatus: parseMpvStatus,

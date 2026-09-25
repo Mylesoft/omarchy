@@ -180,6 +180,40 @@ main() {
 
   payload=$(head -c "$length")
 
+  local action
+  action=$(jq -r '.action // empty' <<<"$payload" 2>/dev/null || true)
+  if [[ $action == "video-playing" ]]; then
+    local video_payload url host response frame
+    video_payload=$(jq -c '.payload // {}' <<<"$payload" 2>/dev/null || printf '{}')
+    url=$(jq -r '.url // empty' <<<"$video_payload" 2>/dev/null || true)
+    host=$(python3 - "$url" <<'PY'
+import sys
+from urllib.parse import urlparse
+u = urlparse(sys.argv[1])
+print((u.hostname or "") if u.scheme == "https" else "")
+PY
+)
+    # Only accept HTTPS video pages from the supported providers.
+    case "$host" in
+      youtube.com|*.youtube.com|youtu.be|facebook.com|*.facebook.com|fb.watch|*.fb.watch|tiktok.com|*.tiktok.com|x.com|*.x.com|twitter.com|*.twitter.com) ;;
+      *) video_payload='{}' ;;
+    esac
+    if [[ $video_payload != '{}' ]]; then
+      response=$(timeout 5 omarchy-shell media browserVideo "$video_payload" 2>/dev/null || true)
+      if [[ $response == "ok" || $response == *'"ok":true'* ]]; then
+        response='{"handoff":true}'
+      else
+        response='{"handoff":false}'
+      fi
+    else
+      response='{"handoff":false}'
+    fi
+    # Emit the binary length prefix directly; storing it in a Bash variable
+    # drops NUL bytes and corrupts Chrome's native messaging response.
+    printf '%s' "$response" | python3 -c 'import struct,sys; b=sys.stdin.buffer.read(); sys.stdout.buffer.write(struct.pack("<I", len(b)) + b)'
+    exit 0
+  fi
+
   # Ack with an empty message so the extension's sendNativeMessage callback resolves cleanly.
   printf '\x02\x00\x00\x00{}'
 

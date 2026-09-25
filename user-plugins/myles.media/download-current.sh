@@ -560,7 +560,9 @@ if not shutil.which("yt-dlp"):
 outtmpl = str(stem) + ".%(ext)s"
 if download_format == "video":
   progress(2, "Video + audio download…")
-  cmd = ["yt-dlp", "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best", "--merge-output-format", "mp4", "--extractor-args", "youtube:player_client=web,android,ios", "--no-playlist", "--newline", "-o", outtmpl, "--no-warnings", url]
+  # Leave resolution uncapped: yt-dlp selects the best available video and audio
+  # streams for each extractor, then merges them into a single download.
+  cmd = ["yt-dlp", "-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4", "--extractor-args", "youtube:player_client=web,android,ios", "--no-playlist", "--newline", "-o", outtmpl, "--no-warnings", url]
 else:
   progress(2, "Audio-only convert (mp3)…")
   cmd = ["yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=webm]/bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "0", "--extractor-args", "youtube:player_client=web,android,ios", "--no-playlist", "--newline", "-o", outtmpl, "--no-warnings", "--no-keep-video", url]

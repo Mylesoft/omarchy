@@ -153,7 +153,7 @@ def ensure_mpv(path="", title=""):
     "--osd-level=1",
     "--script-opts=osc-visibility=auto,osc-autohide-delay=2.0,osc-bar-w=95,osc-deadzone=0",
     "--ytdl=yes",
-    "--ytdl-format=bestvideo[height<=?1080]+bestaudio/best[height<=?1080]/best",
+    "--ytdl-format=bestvideo+bestaudio/best",
     "--hwdec=auto-safe",
     "--loop-file=no",
     "--input-default-bindings=yes",
@@ -620,6 +620,12 @@ elif op == "play":
   # Replace current file and play
   r = ipc(["loadfile", path, "replace"])
   ipc(["set_property", "pause", False])
+  try:
+    start = max(0.0, min(float(params.get("start") or 0), 86400.0))
+    if start > 2.0:
+      ipc(["seek", start, "absolute"])
+  except (TypeError, ValueError):
+    pass
   if params.get("muted"):
     ipc(["set_property", "mute", True])
     ipc(["set_property", "volume", 0])

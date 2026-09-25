@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -u
+path=${1:-}
+[[ -n $path ]] || exit 2
+if command -v omarchy-shell >/dev/null 2>&1; then
+  reply=$(omarchy-shell media playVideo "$path" 2>/dev/null || true)
+  if [[ $reply == *ok* ]]; then exit 0; fi
+fi
+exec mpv --player-operation-mode=pseudo-gui -- "$path"

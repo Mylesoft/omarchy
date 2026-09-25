@@ -13,6 +13,9 @@ Item {
   property string preferredPlayerKey: ""
   property bool followMode: true
   property var playerStartedAt: ({})
+  property string activeWindowAppId: ""
+  property string activeWindowTitle: ""
+  property string lastFocusPlayerKey: ""
   property var pendingTrackOsd: null
   property int playSerial: 0
   property int positionTick: 0
@@ -615,6 +618,104 @@ Item {
     return oldest || playingProxy || null
   }
 
+  function newestPlayingPlayer(requirePlaybackStream) {
+    var newest = null
+    var newestOrder = -1
+    for (var i = 0; i < players.length; i++) {
+      var p = players[i]
+      if (!p || !p.isPlaying || !isListablePlayer(p)) continue
+      if (requirePlaybackStream && !playerHasPlaybackStream(p)) continue
+      var order = playerOrder(p, i + 1000)
+      if (!newest || order > newestOrder) {
+        newest = p
+        newestOrder = order
+      }
+    }
+    return newest
+  }
+
+  function normalizedAppId(value) {
+    return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "")
+  }
+
+  function playerMatchesActiveWindow(player) {
+    if (!player || !activeWindowAppId) return false
+    var win = normalizedAppId(activeWindowAppId)
+    if (!win || win === "quickshell" || win === "omarchymediapip") return false
+    var values = [player.desktopEntry, player.identity, player.dbusName]
+    var candidates = []
+    for (var i = 0; i < values.length; i++) {
+      var value = normalizedAppId(values[i])
+      if (value) candidates.push(value)
+    }
+    // Chromium-based browsers expose different app ids across builds and MPRIS.
+    if (win.indexOf("googlechrome") !== -1 || win.indexOf("chromium") !== -1)
+      candidates.push("chrome", "chromium", "googlechrome")
+    if (win.indexOf("firefox") !== -1) candidates.push("firefox")
+    if (win.indexOf("spotify") !== -1) candidates.push("spotify")
+    for (var j = 0; j < candidates.length; j++) {
+      var candidate = candidates[j]
+      if (candidate === win || candidate.indexOf(win) !== -1 || win.indexOf(candidate) !== -1)
+        return true
+    }
+    return false
+  }
+
+  function focusedPlayingPlayer() {
+    for (var i = 0; i < players.length; i++) {
+      var p = players[i]
+      if (p && p.isPlaying && isListablePlayer(p) && playerMatchesActiveWindow(p)) return p
+    }
+    return null
+  }
+
+  function pauseOtherPlayback(nextPlayer) {
+    var nextKey = playerKey(nextPlayer)
+    var nextIsCliamp = isCliampPlayer(nextPlayer)
+    var nextIsMpv = normalizedAppId(MediaModel.playerAppLabel(nextPlayer)).indexOf("mpv") !== -1
+    if (!nextIsCliamp) haltCliamp()
+    if (mpv && mpv.online && mpv.playing && !nextIsMpv) {
+      runVideoCtl(["pause", "{}"], false)
+      applyMpvSnapshot(Object.assign({}, mpv, { playing: false, paused: true }))
+    }
+    for (var i = 0; i < players.length; i++) {
+      var p = players[i]
+      if (!p || playerKey(p) === nextKey || !p.isPlaying) continue
+      haltPlayer(p)
+    }
+  }
+
+  function followPlayerNow(player) {
+    if (!player || !player.isPlaying || !isListablePlayer(player)) return false
+    var nextKey = playerKey(player)
+    if (!nextKey) return false
+    pauseOtherPlayback(player)
+    preferredPlayerKey = ""
+    followMode = true
+    lastFocusPlayerKey = nextKey
+    rebuildSourceEntries()
+    return true
+  }
+
+  function updateActiveWindow(info) {
+    var app = String((info && (info.class || info.initialClass || info.appId)) || "")
+    var title = String((info && (info.title || info.initialTitle)) || "")
+    var changed = app !== activeWindowAppId
+    activeWindowAppId = app
+    activeWindowTitle = title
+    if (!changed) return
+    var focused = focusedPlayingPlayer()
+    if (focused) followPlayerNow(focused)
+    else lastFocusPlayerKey = ""
+  }
+
+  function handlePlayerStarted(player) {
+    if (!player || !player.isPlaying || !isListablePlayer(player)) return
+    // A new play event is the strongest signal of the source the user just
+    // started; immediately adopt it and pause all competing playback.
+    followPlayerNow(player)
+  }
+
   function selectActivePlayer() {
     if (!followMode && preferredPlayerKey) {
       var pinned = playerForKey(preferredPlayerKey)
@@ -654,7 +755,13 @@ Item {
       }
     }
 
+    var focused = focusedPlayingPlayer()
+    if (focused) return focused
     if (preferred && preferred.isPlaying) return preferred
+    if (followMode) {
+      var newestPlaying = newestPlayingPlayer(true) || newestPlayingPlayer(false)
+      if (newestPlaying) return newestPlaying
+    }
     var streamCandidate = streamPlayer || streamProxy
     var streamPreferred = preferred && playerHasPlaybackStream(preferred) ? preferred : null
     return oldestPlayingPlayer(true) || oldestPlayingPlayer(false) || streamPreferred || streamCandidate || preferred || trackPlayer || trackProxy || controllablePlayer || controllableProxy || identityPlayer || identityProxy || null
@@ -2183,16 +2290,18 @@ Item {
   function playDirectUrl(rawUrl) {
     var u = String(rawUrl || "").trim()
     if (!/^https?:\/\//i.test(u)) { sourceActionError = "Enter a complete http(s) URL"; return false }
-    var host = u.replace(/^https?:\/\//i, "").split(/[/?#]/)[0]
-    var facebook = MediaModel.isFacebookVideoUrl(u)
-    var provider = /(^|\.)youtu\.be$|(^|\.)youtube\.com$/i.test(host) ? "youtube"
-      : (facebook ? "facebook" : (/radio\.garden$/i.test(host) ? "radio-garden" : "url"))
+    var hostMatch = u.match(/^https?:\/\/([^/:?#]+)/i)
+    var host = hostMatch ? hostMatch[1] : ""
+    var provider = MediaModel.mediaProviderForUrl(u)
+    var knownVideoSite = provider === "youtube" || provider === "facebook"
+      || provider === "tiktok" || provider === "x"
     var title = u.split(/[/?#]/).filter(Boolean).pop() || host
     try { title = decodeURIComponent(title.replace(/\+/g, " ")) } catch (e) {}
     sourceActionError = ""
     directUrl = u
     var ok = playSearchResult({ title: title, path: u, provider: provider,
-      video: provider === "youtube" || facebook || MediaModel.pathHasVideoExt(u), stream: /\.(m3u8|mpd)(\?|$)/i.test(u) })
+      video: knownVideoSite || MediaModel.pathHasVideoExt(u) || /\.(m3u8|mpd)(\?|$)/i.test(u),
+      stream: /\.(m3u8|mpd)(\?|$)/i.test(u) })
     if (!ok) sourceActionError = "Could not start this URL. Check that it is public and playable."
     return ok
   }
@@ -2200,16 +2309,17 @@ Item {
   function downloadDirectUrl(rawUrl) {
     var u = String(rawUrl || "").trim()
     if (!/^https?:\/\//i.test(u)) { sourceActionError = "Enter a complete http(s) URL"; return false }
-    var host = u.replace(/^https?:\/\//i, "").split(/[/?#]/)[0]
-    var facebook = MediaModel.isFacebookVideoUrl(u)
-    var provider = /(^|\.)youtu\.be$|(^|\.)youtube\.com$/i.test(host) ? "youtube"
-      : (facebook ? "facebook" : (/radio\.garden$/i.test(host) ? "radio-garden" : "url"))
+    var hostMatch = u.match(/^https?:\/\/([^/:?#]+)/i)
+    var host = hostMatch ? hostMatch[1] : ""
+    var provider = MediaModel.mediaProviderForUrl(u)
+    var knownVideoSite = provider === "youtube" || provider === "facebook"
+      || provider === "tiktok" || provider === "x"
     var title = u.split(/[/?#]/).filter(Boolean).pop() || host
     try { title = decodeURIComponent(title.replace(/\+/g, " ")) } catch (e) {}
     sourceActionError = ""
     directUrl = u
     return downloadCurrent({ hit: { title: title, path: u, provider: provider,
-      video: provider === "youtube" || facebook || MediaModel.pathHasVideoExt(u), stream: false } })
+      video: knownVideoSite || MediaModel.pathHasVideoExt(u) || /\.(m3u8|mpd)(\?|$)/i.test(u), stream: false } })
   }
 
   function handleDownloadEvent(line) {
@@ -3169,10 +3279,29 @@ Item {
     applyMpvSnapshot(Object.assign({}, MediaModel.emptyMpvSnapshot(), {
       online: true, playing: true, paused: false, path: path, title: title || "Video"
     }))
-    runVideoCtl(["play", JSON.stringify({ path: path, title: mpvTitle, muted: !!preserveAudio })], true)
+    runVideoCtl(["play", JSON.stringify({ path: path, title: mpvTitle, muted: !!preserveAudio,
+      start: Math.max(0, Number((payload && payload.startSeconds) || 0)) })], true)
     mpvPollTimer.interval = 400
     mpvPollTimer.restart()
     return true
+  }
+
+  function browserVideo(payloadJson) {
+    var data
+    try { data = JSON.parse(String(payloadJson || "{}")) } catch (e) { return "invalid-payload" }
+    var path = String(data.url || "")
+    if (!/^https:\/\//i.test(path) || !MediaModel.hitIsVideo({ path: path, video: true }))
+      return "unsupported"
+    if (String(playPathOverride || "") === path && videoBackendActive && mpv.online)
+      return "ok"
+    var provider = MediaModel.isYoutubeUrl(path) ? "youtube"
+      : (MediaModel.isFacebookVideoUrl(path) ? "facebook"
+        : (MediaModel.isXVideoUrl(path) ? "x"
+          : (MediaModel.isTikTokVideoUrl(path) ? "tiktok" : "video")))
+    var payload = { path: path, title: String(data.title || "Video").slice(0, 240),
+      artUrl: String(data.poster || "").slice(0, 1500), provider: provider,
+      kind: provider, video: true, startSeconds: Math.max(0, Number(data.startSeconds || 0)) }
+    return playVideoHit(payload) ? "ok" : "unhandled"
   }
 
   function stopVideoBackend(quit) {
@@ -4220,9 +4349,36 @@ Item {
       target: modelData
       function onIsPlayingChanged() {
         root.syncPlayingOrder()
+        if (modelData && modelData.isPlaying) root.handlePlayerStarted(modelData)
         root.rebuildSourceEntries()
       }
+      function onTrackTitleChanged() {
+        if (modelData && modelData.isPlaying) root.handlePlayerStarted(modelData)
+        root.rebuildSourceEntries()
+      }
+      function onTrackArtistChanged() {
+        if (modelData && modelData.isPlaying) root.handlePlayerStarted(modelData)
+      }
     }
+  }
+
+  Process {
+    id: activeWindowProc
+    command: ["hyprctl", "activewindow", "-j"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try { root.updateActiveWindow(JSON.parse(String(text || "{}"))) }
+        catch (e) { root.updateActiveWindow({}) }
+      }
+    }
+  }
+
+  Timer {
+    interval: 300
+    repeat: true
+    running: true
+    onTriggered: if (!activeWindowProc.running) activeWindowProc.running = true
   }
 
   Timer {
@@ -5208,6 +5364,10 @@ Item {
       return root.downloadCurrent() ? "ok" : "unhandled"
     }
 
+    function browserVideo(payloadJson: string): string {
+      return root.browserVideo(payloadJson)
+    }
+
     function applySuggestion(text: string): string {
       root.applySuggestion(String(text || ""))
       return "ok"
@@ -5247,6 +5407,11 @@ Item {
     function playVideo(path: string): string {
       var p = String(path || "").trim()
       if (!p) return "missing-path"
+      if (p.charAt(0) === "/") {
+        var base = p.split("/").pop() || "Video"
+        return root.playVideoHit({ path: p, title: base.replace(/\.[a-z0-9]+$/i, "") || base,
+          provider: "local", kind: "local-video", video: true }) ? "ok" : "unhandled"
+      }
       var title = ""
       var isYt = MediaModel.isYoutubeUrl(p)
       if (isYt) {

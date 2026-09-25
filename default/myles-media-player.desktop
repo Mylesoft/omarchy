@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Omarchy Media Player
+Comment=Play video in the Omarchy Media plugin
+Exec=omarchy-media-open %f
+TryExec=omarchy-media-open
+Icon=video-x-generic
+Terminal=false
+Categories=AudioVideo;Player;Video;
+MimeType=video/mp4;video/webm;video/x-matroska;video/x-msvideo;video/quicktime;video/mpeg;video/x-flv;video/ogg;application/ogg;
