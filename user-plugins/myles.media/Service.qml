@@ -44,6 +44,8 @@ Item {
   property var providerEntries: []
   property string pendingProviderSwitch: ""
   property string activeHubId: ""
+  // User choice outlives the drawer's temporary activeHubId.
+  property string selectedSourceId: ""
   property var hubEntries: []
   property string searchQuery: ""
   property string searchProvider: ""
@@ -135,6 +137,9 @@ Item {
   property string playFrequencyOverride: ""
   property string resolvedRadioFrequency: ""
   property string radioResolveKey: ""
+  // Items visible in the selected source pane, used by the transport buttons.
+  property var sourceNavHits: []
+  property int sourceNavIndex: -1
 
   // Library: favourites / recents / folders (persisted under stateDir).
   property var favouriteItems: []
@@ -546,10 +551,8 @@ Item {
       }
     }
 
-    if (preferredPlayerKey && preferredPlayerKey !== "cliamp" && !alive[preferredPlayerKey]) {
-      preferredPlayerKey = ""
-      followMode = true
-    }
+    // Keep an explicitly selected source pinned while its player is briefly
+    // absent (for example while a browser is starting or reconnecting).
 
     playSerial = serial
     playerStartedAt = next
@@ -687,6 +690,9 @@ Item {
 
   function followPlayerNow(player) {
     if (!player || !player.isPlaying || !isListablePlayer(player)) return false
+    // Auto-follow is useful until the user chooses a source. Once they do,
+    // unrelated MPRIS play events must not steal the selected source.
+    if (!followMode && preferredPlayerKey) return false
     var nextKey = playerKey(player)
     if (!nextKey) return false
     pauseOtherPlayback(player)
@@ -720,6 +726,9 @@ Item {
     if (!followMode && preferredPlayerKey) {
       var pinned = playerForKey(preferredPlayerKey)
       if (pinned && isListablePlayer(pinned)) return pinned
+      // Do not silently display/control a different source while the chosen
+      // player is temporarily unavailable.
+      if (preferredPlayerKey !== "cliamp" && preferredPlayerKey !== "mpv") return null
     }
 
     var preferred = null
@@ -983,7 +992,7 @@ Item {
         launch: hub.launch || "",
         online: !!online,
         playing: !!playing,
-        selected: activeHubId === hub.id,
+        selected: selectedSourceId === hub.id,
         pinned: isPinned(hub.id)
       })
     }
@@ -1155,6 +1164,19 @@ Item {
 
     if (hub.isCliampProvider && hubNeedsSetup(hub.id)) return false
 
+    if (selectedSourceId !== hub.id) {
+      selectedSourceId = hub.id
+      var prefs = {}
+      for (var prefKey in (mediaSettings || {})) prefs[prefKey] = mediaSettings[prefKey]
+      prefs.selectedSourceId = hub.id
+      mediaSettings = prefs
+      persistSettings()
+    }
+
+    if (activeHubId !== hub.id) {
+      sourceNavHits = []
+      sourceNavIndex = -1
+    }
     activeHubId = hub.id
 
     if (hub.isLibraryHub || hub.id === "favourites") {
@@ -2399,6 +2421,18 @@ Item {
 
   function playDownload(item) {
     if (!item || !item.path) return false
+    var downloads = []
+    for (var i = 0; i < downloadItems.length; i++) {
+      var saved = downloadItems[i]
+      if (!saved || !saved.path || saved.status === "failed" || saved.status === "downloading") continue
+      downloads.push({ title: saved.title || "", artist: saved.artist || "", path: saved.path,
+        provider: "local", kind: "local", stream: false })
+    }
+    var selected = -1
+    for (var j = 0; j < downloads.length; j++)
+      if (String(downloads[j].path) === String(item.path)) { selected = j; break }
+    sourceNavHits = downloads
+    sourceNavIndex = selected
     return playSearchResult({
       title: String(item.title || ""),
       artist: String(item.artist || ""),
@@ -2407,6 +2441,20 @@ Item {
       kind: "local",
       stream: false
     })
+  }
+
+  function playSourceHit(hits, index) {
+    if (!Array.isArray(hits) || index < 0 || index >= hits.length || !hits[index]) return false
+    sourceNavHits = hits.slice(0)
+    sourceNavIndex = index
+    return playSearchResult(hits[index])
+  }
+
+  function stepSourceHit(delta) {
+    var hits = sourceNavHits || []
+    if (hits.length < 2 || sourceNavIndex < 0) return false
+    var nextIndex = (sourceNavIndex + delta + hits.length) % hits.length
+    return playSourceHit(hits, nextIndex)
   }
 
   function removeDownload(item) {
@@ -2989,10 +3037,19 @@ Item {
   }
 
   function applySettingsText(text) {
+    var chosenBeforeLoad = selectedSourceId
     try {
       mediaSettings = JSON.parse(String(text || "{}")) || {}
     } catch (e) {
       mediaSettings = {}
+    }
+    var savedSource = String(mediaSettings.selectedSourceId || "")
+    if (chosenBeforeLoad && MediaModel.hubDefById(chosenBeforeLoad)) {
+      selectedSourceId = chosenBeforeLoad
+      mediaSettings.selectedSourceId = chosenBeforeLoad
+      Qt.callLater(function() { root.persistSettings() })
+    } else if (savedSource && MediaModel.hubDefById(savedSource)) {
+      selectedSourceId = savedSource
     }
     if (mediaSettings.defaultSpeed)
       playbackSpeed = Number(mediaSettings.defaultSpeed) || 1.0
@@ -3003,6 +3060,7 @@ Item {
     extrasPinnedSetting = !!mediaSettings.extrasPinned
     extrasTabSetting = String(mediaSettings.extrasTab || "nearby")
     dualAudioEnabled = !!mediaSettings.dualAudioEnabled
+    rebuildHubEntries()
   }
 
   function persistUiPrefs(extrasPinned, extrasTab) {
@@ -3119,6 +3177,12 @@ Item {
 
   function applyMpvSnapshot(snap) {
     var wasOnline = !!(mpv && mpv.online)
+    var previousPosition = Number(mpv && mpv.position) || 0
+    var previousLength = Number(mpv && mpv.length) || 0
+    var videoEnded = !!(mpv && mpv.playing && snap && !snap.playing
+      && sourceNavIndex >= 0 && sourceNavIndex < sourceNavHits.length - 1
+      && ((Number(snap.length) > 0 && Number(snap.position) >= Number(snap.length) - 2)
+        || (previousLength > 0 && previousPosition >= previousLength - 2)))
     mpv = snap || MediaModel.emptyMpvSnapshot()
     if (snap && snap.subs !== undefined) videoSubs = !!snap.subs
     if (snap && snap.fullscreen !== undefined) videoFullscreen = !!snap.fullscreen
@@ -3135,6 +3199,8 @@ Item {
     if (snap && snap.clickThrough !== undefined) videoClickThrough = !!snap.clickThrough
     if (snap && snap.online && !videoPipDismissed)
       videoBackendActive = true
+    if (videoEnded)
+      Qt.callLater(function() { root.stepSourceHit(1) })
     if (snap && !snap.online && videoBackendActive && !videoPipDismissed) {
       // mpv quit from outside — drop backend so cliamp can take over cleanly
       videoBackendActive = false
@@ -4010,25 +4076,31 @@ Item {
       var mvLabel = "Play/pause"
       var mvIcon = "media"
       if (action === "next") {
-        var plCount = Number(mpv.playlistCount || 0)
-        if (plCount > 1) {
+        if (stepSourceHit(1)) {
+          mvLabel = "Next video"; mvIcon = "media-next"
+          mvHandled = true
+        } else if (Number(mpv.playlistCount || 0) > 1) {
           runVideoCtl(["playlistNext", "{}"], true)
           mvLabel = "Next video"; mvIcon = "media-next"
+          mvHandled = true
         } else {
           // Seek +60s as chapter-less next for single-file video.
           seekBy(60, false, "mpv"); mvLabel = "Skip +60s"; mvIcon = "media-next"
+          mvHandled = true
         }
-        mvHandled = true
       } else if (action === "previous") {
-        var plCount2 = Number(mpv.playlistCount || 0)
         var pos = Number(mpv.position || 0)
-        if (plCount2 > 1 && pos < 3) {
+        if (stepSourceHit(-1)) {
+          mvLabel = "Previous video"; mvIcon = "media-previous"
+          mvHandled = true
+        } else if (Number(mpv.playlistCount || 0) > 1 && pos < 3) {
           runVideoCtl(["playlistPrev", "{}"], true)
           mvLabel = "Previous video"; mvIcon = "media-previous"
+          mvHandled = true
         } else {
           seekBy(-10, false, "mpv"); mvLabel = "Back 10s"; mvIcon = "media-previous"
+          mvHandled = true
         }
-        mvHandled = true
       } else if (action === "play") {
         runVideoCtl(["resume", "{}"], false)
         if (dualAudioActive) runCtl(["play"])
@@ -4071,9 +4143,13 @@ Item {
       var bridgeLabel = "Play/pause"
       var bridgeIcon = "media"
       if (action === "next") {
-        runCliamp(["next"]); handledBridge = true; bridgeLabel = "Next"; bridgeIcon = "media-next"
+        handledBridge = stepSourceHit(1)
+        if (!handledBridge) { runCliamp(["next"]); handledBridge = true }
+        bridgeLabel = "Next"; bridgeIcon = "media-next"
       } else if (action === "previous") {
-        runCliamp(["prev"]); handledBridge = true; bridgeLabel = "Previous"; bridgeIcon = "media-previous"
+        handledBridge = stepSourceHit(-1)
+        if (!handledBridge) { runCliamp(["prev"]); handledBridge = true }
+        bridgeLabel = "Previous"; bridgeIcon = "media-previous"
       } else if (action === "play") {
         playCliamp(); handledBridge = true; bridgeLabel = "Play"; bridgeIcon = "media-play"
       } else if (action === "pause") {
@@ -4187,8 +4263,12 @@ Item {
 
   function applyCliampSnapshot(snap) {
     var wasOnline = !!cliamp.online
+    var trackEnded = !!(cliamp.playing && snap && snap.online && !snap.playing
+      && snap.stopped && !snap.stream && Number(snap.length) > 0)
     var prevRev = lastPlaylistRevision
     cliamp = snap
+    if (trackEnded && sourceNavIndex >= 0 && sourceNavIndex < sourceNavHits.length - 1)
+      Qt.callLater(function() { root.stepSourceHit(1) })
     if (snap && snap.online) {
       if (snap.speed && Math.abs(Number(snap.speed) - playbackSpeed) > 0.001)
         playbackSpeed = Number(snap.speed) || playbackSpeed
@@ -4251,10 +4331,7 @@ Item {
         radioResolveKey = ""
       }
     }
-    if (preferredPlayerKey === "cliamp" && !snap.online && pendingFavoritePin !== "cliamp") {
-      preferredPlayerKey = ""
-      followMode = true
-    }
+    // A transient cliamp disconnect does not cancel the user's source choice.
     if ((!wasOnline || pendingFavoritePin === "cliamp") && snap.online && (preferredPlayerKey === "cliamp" || pendingFavoritePin === "cliamp")) {
       preferredPlayerKey = "cliamp"
       followMode = false

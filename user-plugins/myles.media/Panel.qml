@@ -50,6 +50,7 @@ Panel {
   readonly property bool cliampOnline: mediaService ? !!(mediaService.cliamp && mediaService.cliamp.online) : false
   readonly property bool hubOpen: mediaService ? !!mediaService.hubOpen : false
   readonly property string activeHubId: mediaService ? (mediaService.activeHubId || "") : ""
+  readonly property string selectedSourceId: mediaService ? (mediaService.selectedSourceId || "") : ""
   readonly property var activeHub: mediaService ? mediaService.activeHub : null
   readonly property bool hasPlayer: mediaService ? !!mediaService.hasPlayer : false
   readonly property bool isPlaying: mediaService ? !!mediaService.isPlaying : false
@@ -223,10 +224,27 @@ Panel {
     root.mediaService.toggleFavorite(hit)
   }
 
-  function playLibraryHit(hit) {
+  function playLibraryHit(hit, items) {
     if (!root.mediaService || !hit) return
     root.armHoldOpen(2000)
-    root.mediaService.playSearchResult(hit)
+    var hits = []
+    var index = -1
+    var list = Array.isArray(items) ? items : []
+    for (var i = 0; i < list.length; i++) {
+      var row = list[i]
+      var candidate = row && row.hit ? row.hit : row
+      if (!candidate) continue
+      if (candidate.path || candidate.title) {
+        if (candidate === hit || (index < 0
+            && String(candidate.path || "") === String(hit.path || "")
+            && String(candidate.title || "") === String(hit.title || "")
+            && String(candidate.provider || "") === String(hit.provider || "")))
+          index = hits.length
+        hits.push(candidate)
+      }
+    }
+    if (index >= 0) root.mediaService.playSourceHit(hits, index)
+    else root.mediaService.playSourceHit([hit], 0)
   }
 
   function showHitContext(hit) {
@@ -371,7 +389,6 @@ Panel {
     holdOpenTimer.stop()
     root.closeExtras()
     root.blurSearch()
-    if (root.mediaService) root.mediaService.closeHub()
     controller.hide()
   }
 
@@ -415,7 +432,6 @@ Panel {
       holdOpenTimer.stop()
       root.closeExtras()
       if (searchField) searchField.focus = false
-      if (root.mediaService) root.mediaService.closeHub()
     } else if (root.mediaService) {
       root.mediaService.refreshAudioDevices()
       root.mediaService.loadQueue()
@@ -614,7 +630,7 @@ Panel {
                     required property var modelData
                     readonly property var hub: modelData
                     readonly property bool hot: hub && hub.playing
-                    readonly property bool selected: hub && root.activeHubId === hub.id
+                    readonly property bool selected: hub && root.selectedSourceId === hub.id
 
                     width: Style.space(112)
                     height: hubFlick.height
@@ -703,9 +719,9 @@ Panel {
                           panel.mediaService.toggleHubPin(hubCard.hub.id)
                           return
                         }
-                        // Toggle off if already selected — never launches outside.
-                        if (hubCard.selected) {
-                          panel.mediaService.closeHub()
+                        // Keep the chosen source selected. Clicking it again
+                        // only reopens its pane if it was collapsed.
+                        if (panel.activeHubId === hubCard.hub.id) {
                           panel.blurSearch()
                           panel.armHoldOpen(900)
                           return
@@ -2117,6 +2133,7 @@ Panel {
                     model: root.mediaService ? (root.mediaService.nearbyStations || []) : []
                     delegate: Item {
                       required property var modelData
+                      required property int index
                       width: parent ? parent.width : 0
                       height: Style.space(30)
                       Text {
@@ -2139,7 +2156,7 @@ Panel {
                         cursorShape: Qt.PointingHandCursor
                         onClicked: {
                           if (root.mediaService && modelData)
-                            root.mediaService.playSearchResult(modelData)
+                            root.mediaService.playSourceHit(root.mediaService.nearbyStations, index)
                           root.armHoldOpen(2000)
                         }
                       }
@@ -2853,7 +2870,7 @@ Panel {
                       onPressed: function(mouse) {
                         if (mouse.button !== Qt.LeftButton) return
                         mouse.accepted = true
-                        root.playLibraryHit(recentRow.hit)
+                        root.playLibraryHit(recentRow.hit, root.recentItems)
                       }
                       onClicked: function(mouse) {
                         if (mouse.button === Qt.RightButton)
@@ -2971,7 +2988,7 @@ Panel {
                     onPressed: function(mouse) {
                       if (mouse.button !== Qt.LeftButton) return
                       mouse.accepted = true
-                      root.playLibraryHit(favRow.hit)
+                      root.playLibraryHit(favRow.hit, root.libraryItems)
                     }
                     onClicked: function(mouse) {
                       if (mouse.button === Qt.RightButton)
@@ -3091,7 +3108,7 @@ Panel {
                     onPressed: function(mouse) {
                       if (mouse.button !== Qt.LeftButton) return
                       mouse.accepted = true
-                      root.playLibraryHit(hubRecentRow.hit)
+                      root.playLibraryHit(hubRecentRow.hit, root.recentItems)
                     }
                     onClicked: function(mouse) {
                       if (mouse.button === Qt.RightButton)
@@ -3408,7 +3425,7 @@ Panel {
                     return
                   }
                   if (root.searchResults && root.searchResults.length > 0)
-                    root.mediaService.playSearchResult(root.searchResults[0])
+                    root.mediaService.playSourceHit(root.searchResults, 0)
                   else
                     root.mediaService.runSearch()
                 }
@@ -3629,6 +3646,7 @@ Panel {
                 BorderSurface {
                   id: hitRow
                   required property var modelData
+                  required property int index
                   readonly property var hit: modelData
                   readonly property bool loved: root.hitIsFavorite(hit)
 
@@ -3748,7 +3766,7 @@ Panel {
                       if (!root.mediaService || !hitRow.hit) return
                       mouse.accepted = true
                       root.armHoldOpen(2000)
-                      root.mediaService.playSearchResult(hitRow.hit)
+                      root.mediaService.playSourceHit(root.searchResults, index)
                     }
                     onClicked: function(mouse) {
                       if (mouse.button === Qt.RightButton && hitRow.hit)
