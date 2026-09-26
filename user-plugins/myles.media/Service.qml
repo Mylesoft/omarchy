@@ -121,11 +121,27 @@ Item {
   property bool cliampEventsActive: false
   // Live cliamp playlist (queue.list)
   property var queueItems: []
+  property var videoQueueItems: []
+  property int mpvPlaylistTick: 0
+  property var queueOrderItems: []
+  property int queueOrderTick: 0
   property int queueIndex: -1
   property int queueTotal: 0
   property int queueTick: 0
   property int lastPlaylistRevision: -1
   property bool queueBusy: false
+  property bool queueRestoreRefreshPending: false
+  property var savedQueues: []
+  property int savedQueuesTick: 0
+  property var lastPlaybackPayload: null
+  property int playbackRetryCount: 0
+  property bool playbackRetrying: false
+  property bool playbackRestoring: false
+  property bool resumePlayback: false
+  property var pendingPlaybackRestore: null
+  property double lastResumeSaveAt: 0
+  property real resumePositionPending: -1
+  property int resumeSeekAttempts: 0
   // After switching a cliamp provider hub, restore its search once switch settles.
   property string pendingHubSearchRestore: ""
   // yt-dlp direct streams often report title "videoplayback" — keep the search hit label.
@@ -140,6 +156,13 @@ Item {
   // Items visible in the selected source pane, used by the transport buttons.
   property var sourceNavHits: []
   property int sourceNavIndex: -1
+  property var mprisEndStateByKey: ({})
+  property string lastAutoAdvanceKey: ""
+  property double lastAutoAdvanceAt: 0
+  property real segmentLoopStart: -1
+  property real segmentLoopEnd: -1
+  property bool segmentLoopActive: false
+  property string segmentLoopTrackKey: ""
 
   // Library: favourites / recents / folders (persisted under stateDir).
   property var favouriteItems: []
@@ -162,6 +185,7 @@ Item {
   readonly property string recentsPath: stateDir + "/recents.json"
   readonly property string foldersPath: stateDir + "/favourite-folders.json"
   readonly property string downloadsPath: stateDir + "/downloads.json"
+  readonly property string savedQueuesPath: stateDir + "/saved-queues.json"
   readonly property string legacyPinnedHubsPath: Quickshell.env("HOME") + "/.config/omarchy/plugins/myles.media/pinned-hubs.json"
   readonly property string legacySearchHistoryPath: Quickshell.env("HOME") + "/.config/omarchy/plugins/myles.media/search-history.json"
   readonly property int favouriteCount: favouriteItems ? favouriteItems.length : 0
@@ -1173,10 +1197,6 @@ Item {
       persistSettings()
     }
 
-    if (activeHubId !== hub.id) {
-      sourceNavHits = []
-      sourceNavIndex = -1
-    }
     activeHubId = hub.id
 
     if (hub.isLibraryHub || hub.id === "favourites") {
@@ -1634,7 +1654,17 @@ Item {
       if (row) hit = row.hit
     }
     if (!hit) return false
-    return playSearchResult(hit)
+    var list = listFavorites("", "")
+    var hits = []
+    var selected = -1
+    var hitId = MediaModel.favoriteIdFromHit(hit)
+    for (var i = 0; i < list.length; i++) {
+      if (!list[i] || !list[i].hit) continue
+      if (list[i].id === hitId) selected = hits.length
+      hits.push(list[i].hit)
+    }
+    if (selected < 0) return playSourceHit([hit], 0)
+    return playSourceHit(hits, selected)
   }
 
   function shuffleFavorites(provider, folderId) {
@@ -1643,10 +1673,13 @@ Item {
       showOsd("No favourites to shuffle", "media")
       return false
     }
-    var pick = list[Math.floor(Math.random() * list.length)]
-    if (!pick || !pick.hit) return false
-    showOsd("Shuffle · " + (pick.hit.title || "Favourite"), "media")
-    return playSearchResult(pick.hit)
+    var hits = []
+    for (var i = 0; i < list.length; i++)
+      if (list[i] && list[i].hit) hits.push(list[i].hit)
+    if (!hits.length) return false
+    var index = Math.floor(Math.random() * hits.length)
+    showOsd("Shuffle · " + (hits[index].title || "Favourite"), "media")
+    return playSourceHit(hits, index)
   }
 
   function pushRecent(hit) {
@@ -2051,6 +2084,8 @@ Item {
   function playSearchResult(hit) {
     if (!hit) return false
     sourceActionError = ""
+    clearSegmentLoop()
+    if (!playbackRetrying && !playbackRestoring) playbackRetryCount = 0
 
     var hubPlay = activeHubDef()
 
@@ -2077,6 +2112,7 @@ Item {
       kind: String(hit.kind || ""),
       albumId: String(hit.albumId || ""),
       provider: String(hit.provider || cliampActiveProvider || ""),
+      providerId: String(hit.providerId || hit.trackId || hit.id || hit.uri || ""),
       providerLabel: String(hit.providerLabel || ""),
       detail: String(hit.detail || ""),
       channelId: String(hit.channelId || ""),
@@ -2096,6 +2132,8 @@ Item {
     if (hit.track && typeof hit.track === "object") {
       try { payload.track = JSON.parse(JSON.stringify(hit.track)) } catch (e) {}
     }
+    lastPlaybackPayload = payload
+    if (resumePlayback && !playbackRestoring) persistResumeState(true, true)
 
     // Ambiguous local files — ask ffprobe once and cache.
     if (payload.path && !MediaModel.isYoutubeUrl(payload.path)
@@ -2457,6 +2495,43 @@ Item {
     return playSourceHit(hits, nextIndex)
   }
 
+  function advanceSourceAfterEnd(sourceKey, trackSignature) {
+    if (!sourceNavHits || sourceNavHits.length < 2 || sourceNavIndex < 0) return false
+    var key = String(sourceKey || "") + "|" + String(trackSignature || sourceNavIndex)
+    var now = Date.now()
+    if (key === lastAutoAdvanceKey && now - lastAutoAdvanceAt < 3000) return false
+    lastAutoAdvanceKey = key
+    lastAutoAdvanceAt = now
+    Qt.callLater(function() { root.stepSourceHit(1) })
+    return true
+  }
+
+  function observeMprisPlayback(player) {
+    if (!player) return
+    var key = playerKey(player)
+    if (!key) return
+    var states = ({})
+    var previousStates = mprisEndStateByKey || {}
+    for (var existingKey in previousStates)
+      states[existingKey] = previousStates[existingKey]
+    var previous = states[key] || null
+    var position = player.positionSupported ? MediaModel.mediaSeconds(player.position) : 0
+    var length = player.lengthSupported ? MediaModel.mediaSeconds(player.length) : 0
+    var signature = String(player.trackTitle || "") + "|" + String(player.trackArtist || "")
+    if (previous && previous.playing && !player.isPlaying && previous.length > 0
+        && (previous.position >= previous.length - 2 || position >= length - 2)) {
+      var nextBackend = nextOrderedQueueBackend({ title: previous.signature.split("|")[0],
+        artist: previous.signature.split("|")[1] || "" })
+      if (nextBackend === "video") {
+        if (!handoffToVideoQueue()) advanceSourceAfterEnd(key, previous.signature)
+      } else if (nextBackend === "audio") {
+        if (!handoffToAudioQueue()) advanceSourceAfterEnd(key, previous.signature)
+      } else advanceSourceAfterEnd(key, previous.signature)
+    }
+    states[key] = { playing: !!player.isPlaying, position: position, length: length, signature: signature }
+    mprisEndStateByKey = states
+  }
+
   function removeDownload(item) {
     if (!item || !item.path) return false
     var p = String(item.path)
@@ -2564,23 +2639,61 @@ Item {
       searchHint: String(hit.searchHint || ""),
       queueOnly: true
     }
+    var queuePath = String(payload.path || "")
     if (hit.track && typeof hit.track === "object") {
       try { payload.track = JSON.parse(JSON.stringify(hit.track)) } catch (e) {}
     }
+    if ((queuePath || payload.providerId) && isHitQueued(payload)) {
+      showOsd("Already in queue · " + (payload.title || "track"), "media")
+      return true
+    }
 
-    // Video hits join the mpv playlist so next/prev advances videos.
-    if (MediaModel.hitIsVideo(payload) && payload.path) {
-      if (!mpv.online) {
-        // First video in queue — start playback immediately.
-        var playHit = Object.assign({}, payload)
-        playHit.queueOnly = false
-        return playSearchResult(playHit)
+    var ordered = (queueOrderItems || []).slice()
+    var orderedPaths = {}
+    for (var op = 0; op < ordered.length; op++)
+      if (ordered[op] && ordered[op].path) orderedPaths[String(ordered[op].path)] = true
+    if (!ordered.length && isPlaying) {
+      var active = currentHit()
+      if (active && active.path) {
+        var activeItem = {}
+        for (var activeKey in active) activeItem[activeKey] = active[activeKey]
+        activeItem.backend = usingMpv ? "video" : "audio"
+        ordered.push(activeItem)
       }
+    }
+    if (!ordered.length) {
+      var audioQueue = queueItems || []
+      for (var aq = Math.max(0, queueIndex); aq < audioQueue.length; aq++) {
+        var audioItem = audioQueue[aq] || {}
+        var audioCopy = Object.assign({}, audioItem, { backend: "audio" })
+        if (audioCopy.path && !orderedPaths[String(audioCopy.path)]) {
+          ordered.push(audioCopy)
+          orderedPaths[String(audioCopy.path)] = true
+        }
+      }
+      var videoQueue = videoQueueItems || []
+      for (var vq = Math.max(0, Number(mpv.playlistPos) || 0); vq < videoQueue.length; vq++) {
+        var videoItem = videoQueue[vq] || {}
+        var videoCopy = Object.assign({}, videoItem, { backend: "video" })
+        if (videoCopy.path && !orderedPaths[String(videoCopy.path)]) {
+          ordered.push(videoCopy)
+          orderedPaths[String(videoCopy.path)] = true
+        }
+      }
+    }
+    payload.backend = MediaModel.hitIsVideo(payload) ? "video" : "audio"
+    ordered.push(payload)
+    queueOrderItems = ordered
+    queueOrderTick++
+
+    // Keep queue additions in insertion order across the two playback engines.
+    if (MediaModel.hitIsVideo(payload) && payload.path) {
       runVideoCtl(["queue", JSON.stringify({
         path: payload.path,
         title: payload.title,
-        mode: "append"
-      })], true)
+        mode: "append",
+        defer: !!(isPlaying && !usingMpv)
+      })], false)
       showOsd("Queued video · " + (payload.title || "clip"), "media")
       mpvPollTimer.restart()
       return true
@@ -2624,6 +2737,7 @@ Item {
 
   function playQueueIndex(index) {
     var idx = Math.max(0, Math.floor(Number(index) || 0))
+    if (mpv.online && mpv.playing) runVideoCtl(["pause", "{}"], false)
     root.runCtl(["queue-play", JSON.stringify({ index: idx })])
     preferredPlayerKey = "cliamp"
     followMode = false
@@ -2636,6 +2750,9 @@ Item {
 
   function clearQueue() {
     root.runCtl(["queue-clear", "{}"])
+    if (mpv.online) runVideoCtl(["playlistClear", "{}"], false)
+    queueOrderItems = []
+    queueOrderTick++
     showOsd("Queue cleared", "media")
     Qt.callLater(function() { root.loadQueue() })
     return true
@@ -2682,6 +2799,362 @@ Item {
       stream: !!(hit && hit.stream) || root.mediaIsStream,
       provider: (hit && hit.provider) || cliampActiveProvider || "local"
     })
+  }
+
+  function isHitQueued(hit) {
+    var path = String((hit && hit.path) || "")
+    var provider = String((hit && hit.provider) || "").toLowerCase()
+    var track = hit && hit.track && typeof hit.track === "object" ? hit.track : {}
+    var providerId = String((hit && (hit.providerId || hit.trackId || hit.id || hit.uri))
+      || track.providerId || track.trackId || track.id || track.uri || "")
+    if (!path && !providerId) return false
+    function matches(item) {
+      if (!item) return false
+      if (path && String(item.path || item.filename || "") === path) return true
+      var itemTrack = item.track && typeof item.track === "object" ? item.track : {}
+      var itemId = String(item.providerId || item.trackId || item.id || item.uri
+        || itemTrack.providerId || itemTrack.trackId || itemTrack.id || itemTrack.uri || "")
+      var itemProvider = String(item.provider || "").toLowerCase()
+      return !!(providerId && itemId && providerId === itemId
+        && (!provider || !itemProvider || provider === itemProvider))
+    }
+    var items = queueItems || []
+    for (var i = 0; i < items.length; i++)
+      if (matches(items[i])) return true
+    var videos = videoQueueItems || []
+    for (var j = 0; j < videos.length; j++)
+      if (matches(videos[j])) return true
+    var ordered = queueOrderItems || []
+    for (var k = 0; k < ordered.length; k++)
+      if (matches(ordered[k])) return true
+    return false
+  }
+
+  function queueOrderRank(hit) {
+    var path = String((hit && hit.path) || "")
+    var id = String((hit && (hit.providerId || hit.trackId || hit.id || hit.uri)) || "")
+    var title = String((hit && hit.title) || "").toLowerCase()
+    var artist = String((hit && hit.artist) || "").toLowerCase()
+    var items = queueOrderItems || []
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i] || {}
+      if ((path && String(item.path || "") === path)
+          || (id && String(item.providerId || item.trackId || item.id || item.uri || "") === id)
+          || (title && title === String(item.title || "").toLowerCase()
+            && artist === String(item.artist || "").toLowerCase())) return i
+    }
+    return items.length + 1000
+  }
+
+  function reorderQueueOrderItem(item, delta) {
+    var path = String((item && item.path) || "")
+    var id = String((item && (item.providerId || item.id || item.uri)) || "")
+    var title = String((item && item.title) || "").toLowerCase()
+    var artist = String((item && item.artist) || "").toLowerCase()
+    var next = (queueOrderItems || []).slice()
+    for (var i = 0; i < next.length; i++) {
+      var candidate = next[i] || {}
+      if ((path && String(candidate.path || "") === path)
+          || (id && String(candidate.providerId || candidate.id || candidate.uri || "") === id)
+          || (title && String(candidate.title || "").toLowerCase() === title
+            && String(candidate.artist || "").toLowerCase() === artist)) {
+        var target = Math.max(0, Math.min(next.length - 1, i + Number(delta || 0)))
+        if (target === i) return false
+        var moved = next.splice(i, 1)[0]
+        next.splice(target, 0, moved)
+        queueOrderItems = next
+        queueOrderTick++
+        return true
+      }
+    }
+    return false
+  }
+
+  function removeQueueOrderItem(item) {
+    var path = String((item && item.path) || "")
+    var id = String((item && (item.providerId || item.id || item.uri)) || "")
+    var title = String((item && item.title) || "").toLowerCase()
+    var artist = String((item && item.artist) || "").toLowerCase()
+    var next = (queueOrderItems || []).slice()
+    for (var i = 0; i < next.length; i++) {
+      var candidate = next[i] || {}
+      if ((path && String(candidate.path || "") === path)
+          || (id && String(candidate.providerId || candidate.id || candidate.uri || "") === id)
+          || (title && String(candidate.title || "").toLowerCase() === title
+            && String(candidate.artist || "").toLowerCase() === artist)) {
+        next.splice(i, 1)
+        queueOrderItems = next
+        queueOrderTick++
+        return true
+      }
+    }
+    return false
+  }
+
+  function playNextQueueOrderItem(item) {
+    var next = (queueOrderItems || []).slice()
+    var itemPath = String((item && item.path) || "")
+    var itemTitle = String((item && item.title) || "").toLowerCase()
+    var itemArtist = String((item && item.artist) || "").toLowerCase()
+    var from = -1
+    for (var i = 0; i < next.length; i++) {
+      if ((itemPath && String(next[i].path || "") === itemPath)
+          || (itemTitle && String(next[i].title || "").toLowerCase() === itemTitle
+            && String(next[i].artist || "").toLowerCase() === itemArtist)) { from = i; break }
+    }
+    if (from < 0) return false
+    var moving = next.splice(from, 1)[0]
+    var current = currentHit()
+    var currentPath = String((current && current.path) || mediaPath || "")
+    var at = 0
+    for (var j = 0; j < next.length; j++) {
+      if (currentPath && String(next[j].path || "") === currentPath) { at = j + 1; break }
+    }
+    next.splice(at, 0, moving)
+    queueOrderItems = next
+    queueOrderTick++
+    return true
+  }
+
+  function nextOrderedQueueBackend(current) {
+    var items = queueOrderItems || []
+    var path = String((current && (current.path || current.filename)) || "")
+    var title = String((current && current.title) || "").toLowerCase()
+    var artist = String((current && current.artist) || "").toLowerCase()
+    var found = -1
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i] || {}
+      if ((path && String(item.path || "") === path)
+          || (title && String(item.title || "").toLowerCase() === title
+            && String(item.artist || "").toLowerCase() === artist)) {
+        found = i
+        break
+      }
+    }
+    return found >= 0 && found + 1 < items.length ? String(items[found + 1].backend || "") : ""
+  }
+
+  function playVideoQueueIndex(index) {
+    if (cliamp.online && cliamp.playing) {
+      runCtl(["pause", "{}"])
+      patchCliamp({ playing: false })
+    }
+    runVideoCtl(["playlistPlay", JSON.stringify({ index: Math.floor(Number(index) || 0) })], false)
+    runVideoCtl(["resume", "{}"], false)
+    mpvPollTimer.restart()
+    return true
+  }
+
+  function moveVideoQueueIndex(index, to) {
+    runVideoCtl(["playlistMove", JSON.stringify({ index: Math.floor(Number(index) || 0), to: Math.floor(Number(to) || 0) })], false)
+    mpvPollTimer.restart()
+    return true
+  }
+
+  function removeVideoQueueIndex(index) {
+    runVideoCtl(["playlistRemove", JSON.stringify({ index: Math.floor(Number(index) || 0) })], false)
+    mpvPollTimer.restart()
+    return true
+  }
+
+  function jumpToQueueCurrent() {
+    if (usingMpv && mpv.online) {
+      var videoIndex = Math.max(0, Number(mpv.playlistPos) || 0)
+      playVideoQueueIndex(videoIndex)
+      showOsd("Current video in queue", "media")
+      return true
+    }
+    if (cliamp.online && queueTotal > 0) {
+      playQueueIndex(Math.max(0, queueIndex))
+      showOsd("Current audio in queue", "media")
+      return true
+    }
+    showOsd("Current item is outside the media queues", "media")
+    return false
+  }
+
+  function playNextUnifiedQueueItem(delta) {
+    var items = queueOrderItems || []
+    if (!items.length) return false
+    var active = currentHit() || {}
+    var path = String(mediaPath || active.path || playPathOverride || "")
+    var titleText = String(title || active.title || "").toLowerCase()
+    var artistText = String(artist || active.artist || "").toLowerCase()
+    var currentIndex = -1
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i] || {}
+      if ((path && String(item.path || "") === path)
+          || (titleText && String(item.title || "").toLowerCase() === titleText
+            && String(item.artist || "").toLowerCase() === artistText)) {
+        currentIndex = i
+        break
+      }
+    }
+    var target = currentIndex < 0 ? (Number(delta) < 0 ? items.length - 1 : 0) : currentIndex + Number(delta || 0)
+    if (target < 0 || target >= items.length || target === currentIndex) return false
+    var next = items[target] || {}
+    if (String(next.backend || "") === "video") {
+      for (var v = 0; v < videoQueueItems.length; v++) {
+        if (String(videoQueueItems[v].path || "") === String(next.path || ""))
+          return playVideoQueueIndex(Number(videoQueueItems[v].index))
+      }
+    } else {
+      for (var a = 0; a < queueItems.length; a++) {
+        if (String(queueItems[a].path || "") === String(next.path || "")
+            || (String(queueItems[a].title || "").toLowerCase() === String(next.title || "").toLowerCase()
+              && String(queueItems[a].artist || "").toLowerCase() === String(next.artist || "").toLowerCase()))
+          return playQueueIndex(Number(queueItems[a].index))
+      }
+    }
+    return false
+  }
+
+  function handoffToVideoQueue() {
+    if (!videoQueueItems || !videoQueueItems.length || !mpv.online) return false
+    var index = Math.max(0, Number(mpv.playlistPos) || 0)
+    runVideoCtl(["playlistPlay", JSON.stringify({ index: index })], false)
+    runVideoCtl(["resume", "{}"], false)
+    preferredPlayerKey = "mpv"
+    followMode = false
+    videoBackendActive = true
+    mpvPollTimer.restart()
+    return true
+  }
+
+  function handoffToAudioQueue() {
+    if (!queueItems || !queueItems.length || !cliamp.online) return false
+    var index = cliamp.playing ? queueIndex + 1 : queueIndex
+    if (index < 0 || index >= queueTotal) return false
+    runCtl(["queue-play", JSON.stringify({ index: index })])
+    preferredPlayerKey = "cliamp"
+    followMode = false
+    cliampRefreshTimer.interval = 350
+    cliampRefreshTimer.restart()
+    return true
+  }
+
+  function persistSavedQueues() {
+    savedQueuesTick++
+    savedQueuesSaveProc.command = ["bash", "-lc",
+      'mkdir -p "$1" && printf "%s" "$2" > "$3"', "bash", stateDir,
+      JSON.stringify({ version: 1, queues: savedQueues || [] }), savedQueuesPath]
+    savedQueuesSaveProc.running = true
+  }
+
+  function applySavedQueuesText(text) {
+    try {
+      var data = JSON.parse(String(text || "{}")) || {}
+      savedQueues = Array.isArray(data.queues) ? data.queues : []
+    } catch (e) {
+      savedQueues = []
+    }
+    savedQueuesTick++
+  }
+
+  function saveCurrentQueue() {
+    var tracks = []
+    var items = queueItems || []
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i] || {}
+      var path = String(item.path || "")
+      if (!path) continue
+      tracks.push({ title: String(item.title || "Track"), artist: String(item.artist || ""),
+        path: path, provider: String(item.provider || cliampActiveProvider || ""), backend: "audio",
+        providerId: String(item.providerId || "") })
+    }
+    var videos = videoQueueItems || []
+    for (var v = 0; v < videos.length; v++) {
+      var video = videos[v] || {}
+      if (!video.path) continue
+      var videoRank = queueOrderRank(video)
+      var videoSource = videoRank >= 0 && videoRank < (queueOrderItems || []).length
+        ? queueOrderItems[videoRank] : {}
+      tracks.push({ title: String(video.title || "Video"), artist: String(video.artist || ""),
+        path: String(video.path), provider: String((videoSource && videoSource.provider) || video.provider || "youtube"),
+        providerId: String((videoSource && videoSource.providerId) || ""), backend: "video" })
+    }
+    var uniqueTracks = []
+    var seenTracks = {}
+    for (var u = 0; u < tracks.length; u++) {
+      var candidate = tracks[u] || {}
+      var id = String(candidate.providerId || "")
+      var key = id ? (String(candidate.provider || "").toLowerCase() + "|" + id)
+        : String(candidate.path || "")
+      if (!key || seenTracks[key]) continue
+      seenTracks[key] = true
+      uniqueTracks.push(candidate)
+    }
+    tracks = uniqueTracks
+    tracks.sort(function(a, b) { return queueOrderRank(a) - queueOrderRank(b) })
+    if (!tracks.length) {
+      settingsMessage = "The current queue has no tracks that can be saved."
+      return false
+    }
+    var next = (savedQueues || []).slice()
+    var n = next.length + 1
+    next.unshift({ id: String(Date.now()), name: "Queue " + n,
+      savedAt: Date.now(), items: tracks })
+    if (next.length > 20) next.length = 20
+    savedQueues = next
+    persistSavedQueues()
+    showOsd("Queue saved · " + tracks.length + " items", "media")
+    return true
+  }
+
+  function restoreSavedQueue(index) {
+    var saved = (savedQueues || [])[Number(index)]
+    if (!saved || !Array.isArray(saved.items) || !saved.items.length) return false
+    var savedAudioCount = 0
+    for (var c = 0; c < saved.items.length; c++) {
+      var candidate = saved.items[c]
+      if (candidate && candidate.path && String(candidate.backend || "") !== "video"
+          && !MediaModel.hitIsVideo(candidate)) savedAudioCount++
+    }
+    if (savedAudioCount > 0 && !cliamp.online) {
+      ensureCliampDaemon()
+      settingsMessage = "Audio queue service is starting. Restore this saved queue again in a moment."
+      return false
+    }
+    queueRestoreRefreshPending = true
+    queueOrderItems = saved.items.slice()
+    queueOrderTick++
+    runCtl(["queue-clear", "{}"])
+    var audioCount = 0
+    var videoSavedItems = []
+    var firstIsVideo = !!(saved.items[0] && (String(saved.items[0].backend || "") === "video"
+      || MediaModel.hitIsVideo(saved.items[0])))
+    for (var i = 0; i < saved.items.length; i++) {
+      var item = saved.items[i]
+      if (!item || !item.path) continue
+      if (String(item.backend || "") === "video" || MediaModel.hitIsVideo(item)) {
+        videoSavedItems.push({ path: String(item.path), title: String(item.title || "Video") })
+      } else {
+        audioCount++
+        if (!cliamp.online) ensureCliampDaemon()
+        runCtl(["queue-enqueue", JSON.stringify({ path: String(item.path) })])
+      }
+    }
+    if (videoSavedItems.length)
+      runVideoCtl(["playlistRestore", JSON.stringify({ items: videoSavedItems, defer: !firstIsVideo })], false)
+    if (audioCount > 0 && !firstIsVideo)
+      runCtl(["queue-play", JSON.stringify({ index: 0 })])
+    if (firstIsVideo) {
+      preferredPlayerKey = "mpv"
+      mpvPollTimer.restart()
+    } else if (audioCount > 0) preferredPlayerKey = "cliamp"
+    followMode = false
+    showOsd("Restored · " + String(saved.name || "Queue"), "media")
+    return true
+  }
+
+  function deleteSavedQueue(index) {
+    var next = (savedQueues || []).slice()
+    var idx = Math.floor(Number(index))
+    if (idx < 0 || idx >= next.length) return false
+    next.splice(idx, 1)
+    savedQueues = next
+    persistSavedQueues()
+    return true
   }
 
   function revealPath(path) {
@@ -3019,6 +3492,51 @@ Item {
     } catch (e) {}
   }
 
+  function friendlyPlaybackError(value) {
+    var error = String(value || "").trim()
+    var lower = error.toLowerCase()
+    if (!error) return "Playback failed. Retry or choose another source."
+    if (/sign.?in|login|authentication|private|members only/.test(lower))
+      return "This item may require signing in to its source."
+    if (/403|forbidden|blocked|geo|region/.test(lower))
+      return "The source denied access or is unavailable in this region."
+    if (/404|not found|unavailable|removed|deleted/.test(lower))
+      return "This item is unavailable or has been removed."
+    if (/network|connection|timed out|timeout|resolve|dns/.test(lower))
+      return "Network error while opening this item."
+    if (/yt.?dlp|youtube-dl|command not found|no such file/.test(lower))
+      return "A required media tool is missing. Check the media plugin setup."
+    return error.length > 180 ? error.slice(0, 177) + "…" : error
+  }
+
+  function handlePlaybackFailure(value) {
+    var message = friendlyPlaybackError(value)
+    var payload = lastPlaybackPayload || {}
+    var path = String(payload.path || "")
+    var remote = !!payload.stream || path.indexOf("://") >= 0
+      || String(payload.provider || "") !== "local"
+    if (remote && playbackRetryCount < 1 && !playbackRetryTimer.running) {
+      playbackRetryCount++
+      sourceActionError = message + " Retrying once…"
+      playbackRetryTimer.restart()
+      showOsd("Playback failed · retrying", "media")
+      return true
+    }
+    sourceActionError = message
+    showOsd("Playback failed", "media")
+    return false
+  }
+
+  function retryPlayback() {
+    if (!lastPlaybackPayload || playbackRetrying) return false
+    playbackRetryTimer.stop()
+    playbackRetryCount = 0
+    playbackRetrying = true
+    var started = playSearchResult(lastPlaybackPayload)
+    playbackRetrying = false
+    return started
+  }
+
   function persistSettings() {
     var payload = JSON.stringify(mediaSettings || {})
     settingsSaveProc.command = [
@@ -3030,6 +3548,52 @@ Item {
       root.stateDir + "/settings.json"
     ]
     settingsSaveProc.running = true
+  }
+
+  function persistResumeState(force, atStart) {
+    if (!resumePlayback || !lastPlaybackPayload) return false
+    var now = Date.now()
+    if (!force && (!isPlaying || now - lastResumeSaveAt < 10000)) return false
+    lastResumeSaveAt = now
+    var next = {}
+    for (var key in (mediaSettings || {})) next[key] = mediaSettings[key]
+    next.lastPlayback = {
+      hit: lastPlaybackPayload,
+      position: atStart ? 0 : Math.max(0, Number(trackPosition) || 0),
+      sourceId: String(selectedSourceId || ""),
+      savedAt: now
+    }
+    mediaSettings = next
+    persistSettings()
+    return true
+  }
+
+  function setResumePlayback(enabled) {
+    resumePlayback = !!enabled
+    var next = {}
+    for (var key in (mediaSettings || {})) next[key] = mediaSettings[key]
+    next.resumePlayback = resumePlayback
+    mediaSettings = next
+    persistSettings()
+    if (resumePlayback) persistResumeState(true)
+    showOsd(resumePlayback ? "Playback resume on" : "Playback resume off", "media")
+    return true
+  }
+
+  function restoreLastPlayback() {
+    var saved = pendingPlaybackRestore
+    pendingPlaybackRestore = null
+    if (!resumePlayback || !saved || !saved.hit || isPlaying) return false
+    if (saved.sourceId && MediaModel.hubDefById(saved.sourceId))
+      selectedSourceId = String(saved.sourceId)
+    sourceNavHits = [saved.hit]
+    sourceNavIndex = 0
+    resumePositionPending = Math.max(0, Number(saved.position) || 0)
+    playbackRestoring = true
+    var started = playSearchResult(saved.hit)
+    playbackRestoring = false
+    if (started && resumePositionPending > 0) resumeSeekTimer.restart()
+    return started
   }
 
   function loadSettings() {
@@ -3060,6 +3624,11 @@ Item {
     extrasPinnedSetting = !!mediaSettings.extrasPinned
     extrasTabSetting = String(mediaSettings.extrasTab || "nearby")
     dualAudioEnabled = !!mediaSettings.dualAudioEnabled
+    resumePlayback = !!mediaSettings.resumePlayback
+    pendingPlaybackRestore = resumePlayback && mediaSettings.lastPlayback
+      ? mediaSettings.lastPlayback : null
+    if (pendingPlaybackRestore)
+      Qt.callLater(function() { resumeRestoreTimer.restart() })
     rebuildHubEntries()
   }
 
@@ -3177,13 +3746,35 @@ Item {
 
   function applyMpvSnapshot(snap) {
     var wasOnline = !!(mpv && mpv.online)
+    var previousPathForQueue = String((mpv && mpv.path) || "")
+    var previousTitleForQueue = String((mpv && mpv.title) || "")
     var previousPosition = Number(mpv && mpv.position) || 0
     var previousLength = Number(mpv && mpv.length) || 0
     var videoEnded = !!(mpv && mpv.playing && snap && !snap.playing
-      && sourceNavIndex >= 0 && sourceNavIndex < sourceNavHits.length - 1
       && ((Number(snap.length) > 0 && Number(snap.position) >= Number(snap.length) - 2)
         || (previousLength > 0 && previousPosition >= previousLength - 2)))
+    var playlist = snap && Array.isArray(snap.playlist) ? snap.playlist : []
+    var nextVideoQueue = []
+    for (var p = 0; p < playlist.length; p++) {
+      var entry = playlist[p] || {}
+      var path = String(entry.filename || entry.path || "")
+      if (!path) continue
+      nextVideoQueue.push({
+        backend: "video",
+        index: p,
+        path: path,
+        title: String(entry.title || entry.filename || "Video"),
+        artist: String(entry.artist || ""),
+        current: !!entry.current || p === Number(snap.playlistPos)
+      })
+    }
+    videoQueueItems = nextVideoQueue
+    mpvPlaylistTick++
     mpv = snap || MediaModel.emptyMpvSnapshot()
+    if (mpv.playing) {
+      sourceActionError = ""
+      playbackRetryCount = 0
+    }
     if (snap && snap.subs !== undefined) videoSubs = !!snap.subs
     if (snap && snap.fullscreen !== undefined) videoFullscreen = !!snap.fullscreen
     if (snap && snap.loop !== undefined) mpvLoopMode = String(snap.loop || "no")
@@ -3199,8 +3790,17 @@ Item {
     if (snap && snap.clickThrough !== undefined) videoClickThrough = !!snap.clickThrough
     if (snap && snap.online && !videoPipDismissed)
       videoBackendActive = true
-    if (videoEnded)
-      Qt.callLater(function() { root.stepSourceHit(1) })
+    if (videoEnded) {
+      var atVideoQueueEnd = Number(snap.playlistPos) >= Number(snap.playlistCount) - 1
+      if (atVideoQueueEnd && handoffToAudioQueue()) {}
+      else advanceSourceAfterEnd("mpv", String(playPathOverride || snap.path || ""))
+    }
+    if (snap && snap.playing && previousPathForQueue && snap.path
+        && previousPathForQueue !== String(snap.path)
+        && nextOrderedQueueBackend({ path: previousPathForQueue, title: previousTitleForQueue }) === "audio") {
+      runVideoCtl(["pause", "{}"], false)
+      if (!handoffToAudioQueue()) runVideoCtl(["resume", "{}"], false)
+    }
     if (snap && !snap.online && videoBackendActive && !videoPipDismissed) {
       // mpv quit from outside — drop backend so cliamp can take over cleanly
       videoBackendActive = false
@@ -3832,6 +4432,61 @@ Item {
     return true
   }
 
+  function segmentLoopKey() {
+    return String(mediaPath || playPathOverride || title || "") + "|" + String(artist || "")
+  }
+
+  function setSegmentLoopStart() {
+    if (!canSeek || trackLength <= 0) return false
+    segmentLoopStart = trackPosition
+    segmentLoopEnd = -1
+    segmentLoopActive = false
+    segmentLoopTrackKey = segmentLoopKey()
+    showOsd("Loop start · " + formatClock(segmentLoopStart), "media")
+    return true
+  }
+
+  function toggleSegmentLoopEnd() {
+    if (!canSeek || trackLength <= 0) return false
+    if (segmentLoopActive) {
+      segmentLoopStart = -1
+      segmentLoopEnd = -1
+      segmentLoopActive = false
+      segmentLoopTrackKey = ""
+      showOsd("Section loop off", "media")
+      return true
+    }
+    if (segmentLoopStart < 0 || segmentLoopTrackKey !== segmentLoopKey())
+      return setSegmentLoopStart()
+    if (trackPosition <= segmentLoopStart + 0.5) {
+      showOsd("Set B after A", "media")
+      return false
+    }
+    segmentLoopEnd = trackPosition
+    segmentLoopActive = true
+    showOsd("Looping " + formatClock(segmentLoopStart) + "–" + formatClock(segmentLoopEnd), "media")
+    return true
+  }
+
+  function adjustSegmentLoopEndpoint(seconds, endpoint) {
+    if (!segmentLoopActive || trackLength <= 0) return false
+    var value = Math.max(0, Math.min(trackLength, Number(seconds) || 0))
+    if (Number(endpoint) === 0)
+      segmentLoopStart = Math.min(value, segmentLoopEnd - 0.5)
+    else
+      segmentLoopEnd = Math.max(value, segmentLoopStart + 0.5)
+    segmentLoopTrackKey = segmentLoopKey()
+    positionTick++
+    return true
+  }
+
+  function clearSegmentLoop() {
+    segmentLoopStart = -1
+    segmentLoopEnd = -1
+    segmentLoopActive = false
+    segmentLoopTrackKey = ""
+  }
+
   function seekBy(offsetSeconds, showFeedback, targetKey) {
     if (usingMpv || targetKey === "mpv") {
       if (!mpv.online) return false
@@ -3976,6 +4631,10 @@ Item {
     for (var k in cliamp) snap[k] = cliamp[k]
     snap.volume = target
     cliamp = snap
+    if (snap && snap.playing) {
+      sourceActionError = ""
+      playbackRetryCount = 0
+    }
     cliampUnityGainArmed = true
     return true
   }
@@ -4061,6 +4720,16 @@ Item {
   }
 
   function runAction(action, showFeedback, targetKey) {
+    if (action === "next" && (queueOrderItems || []).length > 1
+        && playNextUnifiedQueueItem(1)) {
+      if (showFeedback !== false) showOsd("Next in unified queue", "media-next")
+      return true
+    }
+    if (action === "previous" && (queueOrderItems || []).length > 1
+        && trackPosition < 3 && playNextUnifiedQueueItem(-1)) {
+      if (showFeedback !== false) showOsd("Previous in unified queue", "media-previous")
+      return true
+    }
     if (action === "setPosition" || action === "seek" || action === "setVolume"
         || action === "toggleShuffle" || action === "cycleLoop" || action === "followPlaying") {
       if (action === "followPlaying") return followPlaying()
@@ -4263,12 +4932,27 @@ Item {
 
   function applyCliampSnapshot(snap) {
     var wasOnline = !!cliamp.online
+    var previousPathForQueue = String((cliamp && cliamp.path) || "")
+    var previousTrackForQueue = { path: previousPathForQueue, title: String(cliamp.title || ""), artist: String(cliamp.artist || "") }
+    var audioChangedTrack = !!(snap && snap.playing && cliamp.playing && snap.path
+      && previousPathForQueue && previousPathForQueue !== String(snap.path))
     var trackEnded = !!(cliamp.playing && snap && snap.online && !snap.playing
       && snap.stopped && !snap.stream && Number(snap.length) > 0)
     var prevRev = lastPlaylistRevision
     cliamp = snap
-    if (trackEnded && sourceNavIndex >= 0 && sourceNavIndex < sourceNavHits.length - 1)
-      Qt.callLater(function() { root.stepSourceHit(1) })
+    if (trackEnded) {
+      var atAudioQueueEnd = Number(queueIndex) >= Number(queueTotal) - 1
+      if (atAudioQueueEnd && handoffToVideoQueue()) {}
+      else advanceSourceAfterEnd("cliamp", String(cliamp.path || playPathOverride || ""))
+    }
+    if (audioChangedTrack && nextOrderedQueueBackend(previousTrackForQueue) === "video") {
+      runCtl(["pause", "{}"])
+      patchCliamp({ playing: false })
+      if (!handoffToVideoQueue()) {
+        runCtl(["play", "{}"])
+        patchCliamp({ playing: true })
+      }
+    }
     if (snap && snap.online) {
       if (snap.speed && Math.abs(Number(snap.speed) - playbackSpeed) > 0.001)
         playbackSpeed = Number(snap.speed) || playbackSpeed
@@ -4371,6 +5055,7 @@ Item {
     root.refreshAudioDevices()
     root.refreshEqPresets()
     root.loadQueue()
+    savedQueuesLoadProc.running = true
     root.resolveVolumeSink()
     // Scrub legacy state files from the plugin dir — writes there trigger
     // Omarchy's inotify reload and destroy the open drawer mid-use.
@@ -4425,11 +5110,13 @@ Item {
       required property var modelData
       target: modelData
       function onIsPlayingChanged() {
+        root.observeMprisPlayback(modelData)
         root.syncPlayingOrder()
         if (modelData && modelData.isPlaying) root.handlePlayerStarted(modelData)
         root.rebuildSourceEntries()
       }
       function onTrackTitleChanged() {
+        root.observeMprisPlayback(modelData)
         if (modelData && modelData.isPlaying) root.handlePlayerStarted(modelData)
         root.rebuildSourceEntries()
       }
@@ -4474,7 +5161,63 @@ Item {
       : (root.usingCliamp
         ? !!root.cliamp.playing
         : !!(root.activePlayer && root.activePlayer.isPlaying && root.activePlayer.positionSupported))
-    onTriggered: root.positionTick++
+    onTriggered: {
+      root.positionTick++
+      if (!root.usingMpv && !root.usingCliamp)
+        root.observeMprisPlayback(root.activePlayer)
+      root.persistResumeState(false)
+      if (root.segmentLoopActive) {
+        if (root.segmentLoopTrackKey !== root.segmentLoopKey()) {
+          root.clearSegmentLoop()
+        } else if (root.isPlaying && root.trackPosition >= root.segmentLoopEnd) {
+          var key = root.usingMpv ? "mpv" : (root.usingCliamp ? "cliamp" : root.playerKey(root.activePlayer))
+          root.setPosition(root.segmentLoopStart, false, key)
+        }
+      }
+    }
+  }
+
+  Timer {
+    id: playbackRetryTimer
+    interval: 2000
+    repeat: false
+    onTriggered: {
+      if (!root.lastPlaybackPayload) return
+      root.playbackRetrying = true
+      root.playSearchResult(root.lastPlaybackPayload)
+      root.playbackRetrying = false
+    }
+  }
+
+  Timer {
+    id: resumeRestoreTimer
+    interval: 3000
+    repeat: false
+    onTriggered: root.restoreLastPlayback()
+  }
+
+  Timer {
+    id: resumeSeekTimer
+    interval: 1600
+    repeat: false
+    onTriggered: {
+      if (root.resumePositionPending <= 0) return
+      if (root.canSeek && root.trackLength > 0) {
+        var target = root.usingMpv ? "mpv" : (root.usingCliamp ? "cliamp" : root.playerKey(root.activePlayer))
+        if (root.setPosition(Math.min(root.resumePositionPending, root.trackLength - 1), false, target)) {
+          root.resumePositionPending = -1
+          root.resumeSeekAttempts = 0
+          root.showOsd("Playback resumed", "media")
+          return
+        }
+      }
+      root.resumeSeekAttempts++
+      if (root.resumeSeekAttempts < 5) resumeSeekTimer.restart()
+      else {
+        root.resumePositionPending = -1
+        root.resumeSeekAttempts = 0
+      }
+    }
   }
 
   Timer {
@@ -4739,19 +5482,18 @@ Item {
           if (data && data.provider) root.cliampActiveProvider = String(data.provider)
           if (data && data.path) root.playPathOverride = String(data.path)
           if (data && data.ok === false && data.error) {
-            root.sourceActionError = String(data.error)
-            root.showOsd(String(data.error), "media")
-          } else if (data && data.ok) root.sourceActionError = ""
+            root.handlePlaybackFailure(data.error)
+          } else if (data && data.ok) {
+            root.sourceActionError = ""
+            root.playbackRetryCount = 0
+          }
         } catch (e) {}
         cliampRefreshTimer.interval = 400
         cliampRefreshTimer.restart()
       }
     }
     onExited: function(exitCode) {
-      if (exitCode !== 0 && !root.sourceActionError) {
-        root.sourceActionError = "Playback failed. The source may require sign-in or may be unavailable."
-        root.showOsd("Play failed", "media")
-      }
+      if (exitCode !== 0) root.handlePlaybackFailure("Playback failed. Check the source or network.")
       cliampRefreshTimer.interval = 400
       cliampRefreshTimer.restart()
     }
@@ -4924,7 +5666,13 @@ Item {
     }
     onExited: function() {
       root.ctlBusy = false
-      Qt.callLater(function() { root.pumpCtlQueue() })
+      Qt.callLater(function() {
+        root.pumpCtlQueue()
+        if (root.queueRestoreRefreshPending && !root.ctlBusy && !(root.ctlQueue || []).length) {
+          root.queueRestoreRefreshPending = false
+          root.loadQueue()
+        }
+      })
     }
   }
 
@@ -5131,6 +5879,22 @@ Item {
 
   Process {
     id: settingsSaveProc
+    command: ["true"]
+  }
+
+  Process {
+    id: savedQueuesLoadProc
+    command: ["bash", "-lc",
+      'if [[ -f "$1" ]]; then cat "$1"; else echo "{\"version\":1,\"queues\":[]}"; fi',
+      "bash", root.savedQueuesPath]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applySavedQueuesText(text)
+    }
+  }
+
+  Process {
+    id: savedQueuesSaveProc
     command: ["true"]
   }
 

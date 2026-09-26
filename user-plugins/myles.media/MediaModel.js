@@ -805,12 +805,14 @@ function parseCliampQueueList(text) {
     var rows = []
     for (var i = 0; i < tracks.length; i++) {
       var t = tracks[i] || {}
+      var meta = t.provider_meta || t.providerMeta || t.metadata || {}
       rows.push({
         index: i,
         title: String(t.title || t.name || t.path || "Track"),
         artist: String(t.artist || ""),
         path: String(t.path || ""),
-        provider: String(t.provider || "")
+        provider: String(t.provider || ""),
+        providerId: String(t.providerId || t.trackId || t.id || t.uri || meta.providerId || meta.trackId || meta.id || meta.uri || "")
       })
     }
     out.tracks = rows
@@ -1110,7 +1112,8 @@ function emptyMpvSnapshot() {
     subs: false,
     loop: "no",
     playlistCount: 0,
-    playlistPos: -1
+    playlistPos: -1,
+    playlist: []
   }
 }
 
@@ -1131,6 +1134,7 @@ function parseMpvStatus(text) {
     snap.loop = String(data.loop || "no")
     snap.playlistCount = Number(data.playlistCount || 0) || 0
     snap.playlistPos = data.playlistPos !== undefined ? Number(data.playlistPos) : -1
+    snap.playlist = Array.isArray(data.playlist) ? data.playlist : []
     if (data.geometry && typeof data.geometry === "object")
       snap.geometry = data.geometry
     if (data.aspectLock !== undefined) snap.aspectLock = !!data.aspectLock

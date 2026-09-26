@@ -553,7 +553,7 @@ def status_payload():
       "ok": True, "online": False, "playing": False, "paused": True,
       "path": "", "title": "", "position": 0, "length": 0,
       "volume": 1.0, "fullscreen": False, "subs": False,
-      "loop": "no", "playlistCount": 0, "playlistPos": -1,
+      "loop": "no", "playlistCount": 0, "playlistPos": -1, "playlist": [],
       "aspectLock": g.get("aspectLock", True),
       "clickThrough": bool(g.get("clickThrough")),
       "geometry": g,
@@ -575,6 +575,7 @@ def status_payload():
     pl_pos = int(get_prop("playlist-pos", -1) or -1)
   except Exception:
     pl_pos = -1
+  playlist = get_prop("playlist", []) or []
   return {
     "ok": True,
     "online": True,
@@ -590,6 +591,7 @@ def status_payload():
     "loop": loop,
     "playlistCount": pl_count,
     "playlistPos": pl_pos,
+    "playlist": playlist if isinstance(playlist, list) else [],
     "aspectLock": g.get("aspectLock", True),
     "clickThrough": bool(g.get("clickThrough")),
     "geometry": g,
@@ -788,6 +790,8 @@ elif op == "queue" or op == "enqueue":
   if mode not in ("append", "append-play", "replace"):
     mode = "append"
   r = ipc(["loadfile", path, mode])
+  if bool(params.get("defer")):
+    set_prop("pause", True)
   title = str(params.get("title") or "").strip()
   if mode in ("append", "append-play"):
     # Don't lock the whole playlist to this title.
@@ -820,6 +824,46 @@ elif op == "playlistPrev" or op == "playlist-prev":
 
 elif op == "playlistClear" or op == "playlist-clear":
   ipc(["playlist-clear"])
+
+elif op == "playlistPlay" or op == "playlist-play":
+  index = int(params.get("index", -1))
+  if index < 0:
+    print(json.dumps({"ok": False, "error": "invalid-index"}))
+    raise SystemExit(2)
+  print(json.dumps({"ok": True, "result": ipc(["playlist-play-index", index])}))
+
+elif op == "playlistMove" or op == "playlist-move":
+  index, to = int(params.get("index", -1)), int(params.get("to", -1))
+  if index < 0 or to < 0:
+    print(json.dumps({"ok": False, "error": "invalid-index"}))
+    raise SystemExit(2)
+  print(json.dumps({"ok": True, "result": ipc(["playlist-move", index, to])}))
+
+elif op == "playlistRemove" or op == "playlist-remove":
+  index = int(params.get("index", -1))
+  if index < 0:
+    print(json.dumps({"ok": False, "error": "invalid-index"}))
+    raise SystemExit(2)
+  print(json.dumps({"ok": True, "result": ipc(["playlist-remove", index])}))
+
+elif op == "playlistRestore" or op == "playlist-restore":
+  items = params.get("items") if isinstance(params.get("items"), list) else []
+  if not items:
+    print(json.dumps({"ok": False, "error": "empty-playlist"}))
+    raise SystemExit(2)
+  if not ensure_mpv():
+    print(json.dumps({"ok": False, "error": "mpv-start-failed"}))
+    raise SystemExit(2)
+  ipc(["playlist-clear"])
+  for index, item in enumerate(items):
+    if not isinstance(item, dict) or not str(item.get("path") or "").strip():
+      continue
+    path = str(item.get("path") or "").strip()
+    mode = "append" if index == 0 and bool(params.get("defer")) else ("replace" if index == 0 else "append")
+    ipc(["loadfile", path, mode])
+  if bool(params.get("defer")):
+    set_prop("pause", True)
+  print(json.dumps({"ok": True, **status_payload()}))
   print(json.dumps({"ok": True, **status_payload()}))
 
 elif op == "ffprobe":

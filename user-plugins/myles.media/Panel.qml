@@ -81,6 +81,16 @@ Panel {
   readonly property bool shuffling: mediaService ? !!mediaService.shuffle : false
   readonly property bool canGoPrevious: mediaService ? !!mediaService.canGoPrevious : false
   readonly property bool canGoNext: mediaService ? !!mediaService.canGoNext : false
+  readonly property bool segmentLoopActive: mediaService ? !!mediaService.segmentLoopActive : false
+  readonly property real segmentLoopStart: mediaService ? Number(mediaService.segmentLoopStart) : -1
+  readonly property real segmentLoopEnd: mediaService ? Number(mediaService.segmentLoopEnd) : -1
+  readonly property string nextSourceTitle: {
+    var hits = mediaService ? (mediaService.sourceNavHits || []) : []
+    var index = mediaService ? Number(mediaService.sourceNavIndex) : -1
+    if (!hits || hits.length < 2 || index < 0) return ""
+    var next = hits[(index + 1) % hits.length]
+    return String((next && (next.title || next.path)) || "")
+  }
   readonly property bool canTogglePlaying: mediaService ? !!mediaService.canTogglePlaying : false
   readonly property bool searchAvailable: mediaService ? !!mediaService.searchAvailable : false
   readonly property string searchProviderLabel: mediaService ? (mediaService.searchProviderLabel || "") : ""
@@ -119,8 +129,61 @@ Panel {
     return mediaService ? (mediaService.queueItems || []) : []
   }
   readonly property int queueIndex: mediaService ? Number(mediaService.queueIndex || 0) : 0
-  readonly property int queueTotal: mediaService ? Number(mediaService.queueTotal || 0) : 0
+  readonly property var videoQueueItems: {
+    var _t = mediaService ? mediaService.mpvPlaylistTick : 0
+    return mediaService ? (mediaService.videoQueueItems || []) : []
+  }
+  readonly property var unifiedQueueItems: {
+    var _orderTick = mediaService ? mediaService.queueOrderTick : 0
+    var audio = root.queueItems || []
+    var videos = root.videoQueueItems || []
+    var out = []
+    var seen = {}
+    var seenIds = {}
+    var audioStart = Math.max(0, root.queueIndex)
+    for (var i = audioStart; i < audio.length; i++) {
+      var a = audio[i] || {}
+      var ap = String(a.path || "")
+      var aid = String(a.providerId || a.trackId || a.id || a.uri || "")
+      if ((ap && seen[ap]) || (aid && seenIds[String(a.provider || "").toLowerCase() + "|" + aid])) continue
+      if (ap) seen[ap] = true
+      if (aid) seenIds[String(a.provider || "").toLowerCase() + "|" + aid] = true
+      out.push(Object.assign({}, a, { backend: "audio", backendIndex: Number(a.index !== undefined ? a.index : i), current: i === root.queueIndex }))
+    }
+    var videoStart = mediaService ? Math.max(0, Number(mediaService.mpv.playlistPos || 0)) : 0
+    for (var j = videoStart; j < videos.length; j++) {
+      var v = videos[j] || {}
+      var vp = String(v.path || "")
+      var vid = String(v.providerId || v.trackId || v.id || v.uri || "")
+      if ((vp && seen[vp]) || (vid && seenIds[String(v.provider || "").toLowerCase() + "|" + vid])) continue
+      if (vp) seen[vp] = true
+      if (vid) seenIds[String(v.provider || "").toLowerCase() + "|" + vid] = true
+      out.push(Object.assign({}, v, { backend: "video", backendIndex: Number(v.index !== undefined ? v.index : j), current: !!v.current }))
+    }
+    out.sort(function(a, b) {
+      var ar = mediaService ? mediaService.queueOrderRank(a) : 0
+      var br = mediaService ? mediaService.queueOrderRank(b) : 0
+      return ar - br
+    })
+    return out
+  }
+  readonly property var filteredUnifiedQueueItems: {
+    var _tick = mediaService ? mediaService.queueOrderTick : 0
+    var query = String(root.queueFilterText || "").trim().toLowerCase()
+    var items = root.unifiedQueueItems
+    if (!query) return items
+    return items.filter(function(item) {
+      return [item.title, item.artist, item.provider, item.path, item.backend]
+        .join(" ").toLowerCase().indexOf(query) !== -1
+    })
+  }
+  readonly property int queueTotal: root.unifiedQueueItems.length
   readonly property bool queueBusy: mediaService ? !!mediaService.queueBusy : false
+  readonly property var savedQueues: {
+    var _t = mediaService ? mediaService.savedQueuesTick : 0
+    return mediaService ? (mediaService.savedQueues || []) : []
+  }
+  readonly property bool resumePlayback: mediaService ? !!mediaService.resumePlayback : false
   readonly property var localFolders: mediaService ? (mediaService.localFolders || []) : []
   readonly property string localFolderFilter: mediaService ? (mediaService.localFolderFilter || "") : ""
   readonly property bool isRecentsHub: !!(root.activeHub && (root.activeHub.isRecentsHub || root.activeHubId === "recents"))
@@ -129,6 +192,7 @@ Panel {
   property bool extrasHover: false
   readonly property bool extrasOpen: extrasPinned || extrasHover
   property bool showQueue: false
+  property string queueFilterText: ""
   property bool showLyrics: false
   // Transport extras tab: nearby | share | sleep | output | speed | eq | lyrics
   property string extrasTab: "nearby"
@@ -222,6 +286,12 @@ Panel {
     if (!root.mediaService || !hit) return
     root.armHoldOpen(1200)
     root.mediaService.toggleFavorite(hit)
+  }
+
+  function queueHit(hit) {
+    if (!root.mediaService || !hit) return
+    root.mediaService.queueSearchResult(hit)
+    root.armHoldOpen(1500)
   }
 
   function playLibraryHit(hit, items) {
@@ -672,7 +742,9 @@ Panel {
                         textFormat: Text.PlainText
                         text: {
                           if (!hubCard.hub) return ""
-                          if (hubCard.selected) return "Selected"
+                          if (hubCard.selected)
+                            return hubCard.hub.playing ? "Selected · Playing"
+                              : (hubCard.hub.online ? "Selected · Ready" : "Selected · Offline")
                           if (hubCard.hub.playing) return "Playing"
                           // Favourites / Downloads show live counts from detail.
                           if (hubCard.hub.isLibraryHub || hubCard.hub.id === "favourites"
@@ -795,6 +867,15 @@ Panel {
               wrapMode: Text.WordWrap
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
+            }
+
+            Button {
+              text: "Retry playback"
+              foreground: Color.accent
+              visible: root.sourceActionError !== "" && !!(root.mediaService && root.mediaService.lastPlaybackPayload)
+              horizontalPadding: Style.space(10)
+              verticalPadding: Style.space(4)
+              onClicked: if (root.mediaService) root.mediaService.retryPlayback()
             }
 
             BorderSurface {
@@ -923,10 +1004,50 @@ Panel {
                   minimum: 0
                   maximum: Math.max(1, root.trackLength)
                   value: root.trackPosition
+                  selectionStart: root.segmentLoopActive ? root.segmentLoopStart : -1
+                  selectionEnd: root.segmentLoopActive ? root.segmentLoopEnd : -1
+                  selectionDraggable: root.segmentLoopActive
+                  onSelectionMoved: function(v, endpoint) {
+                    if (root.mediaService) root.mediaService.adjustSegmentLoopEndpoint(v, endpoint)
+                  }
                   step: 5
                   onReleased: function(v) {
                     if (root.mediaService) root.mediaService.setPosition(v, false)
                   }
+                }
+
+                Row {
+                  width: parent.width
+                  visible: root.segmentLoopActive
+                  Text {
+                    id: loopSegmentLabel
+                    textFormat: Text.PlainText
+                    text: root.mediaService ? ("A " + root.mediaService.formatClock(root.segmentLoopStart)) : "A"
+                    color: Color.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                  Item { width: Math.max(0, parent.width - loopSegmentLabel.width - loopEndLabel.width); height: 1 }
+                  Text {
+                    id: loopEndLabel
+                    textFormat: Text.PlainText
+                    text: root.mediaService ? ("B " + root.mediaService.formatClock(root.segmentLoopEnd) + " · LOOPING") : "B"
+                    color: Color.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  visible: root.nextSourceTitle !== ""
+                  textFormat: Text.PlainText
+                  text: "UP NEXT · " + root.nextSourceTitle
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
                 }
 
                 // Live / non-seekable — visual track with pulsing live marker + dial frequency
@@ -1094,6 +1215,38 @@ Panel {
                   horizontalPadding: Style.space(6)
                   verticalPadding: Style.space(5)
                   onClicked: if (root.mediaService) root.mediaService.runAction("cycleLoop", true)
+                }
+                Button {
+                  iconText: "A"
+                  foreground: root.segmentLoopStart >= 0 ? Color.accent : root.foreground
+                  enabled: root.canSeek && root.trackLength > 0
+                  opacity: enabled ? 1.0 : 0.35
+                  horizontalPadding: Style.space(6)
+                  verticalPadding: Style.space(5)
+                  onClicked: if (root.mediaService) root.mediaService.setSegmentLoopStart()
+                }
+                Button {
+                  iconText: root.segmentLoopActive ? "A-B" : "B"
+                  foreground: root.segmentLoopActive ? Color.accent : root.foreground
+                  enabled: root.canSeek && root.trackLength > 0
+                  opacity: enabled ? 1.0 : 0.35
+                  horizontalPadding: Style.space(6)
+                  verticalPadding: Style.space(5)
+                  onClicked: if (root.mediaService) root.mediaService.toggleSegmentLoopEnd()
+                }
+                Button {
+                  iconText: "󰐑"
+                  text: "Queue"
+                  tooltipText: "Add current track to queue"
+                  foreground: root.foreground
+                  enabled: root.canQueueCurrent
+                  opacity: enabled ? 1.0 : 0.35
+                  horizontalPadding: Style.space(6)
+                  verticalPadding: Style.space(5)
+                  onClicked: {
+                    if (root.mediaService) root.mediaService.queueCurrentTrack()
+                    root.armHoldOpen(1500)
+                  }
                 }
                 Button {
                   iconText: root.downloadBusy ? "󰜺" : "󰇚"
@@ -1619,15 +1772,23 @@ Panel {
                   Text {
                     textFormat: Text.PlainText
                     text: root.queueTotal > 0
-                      ? ("QUEUE · " + (root.queueIndex + 1) + " / " + root.queueTotal)
+                      ? ("QUEUE · " + root.queueTotal + " audio/video items")
                       : (root.queueBusy ? "QUEUE · loading…" : "QUEUE · empty")
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     font.bold: true
-                    width: parent.width - clearQueueBtn.width - queueNowBtn.width - Style.space(16)
+                    width: parent.width - clearQueueBtn.width - queueNowBtn.width - saveQueueBtn.width - queueJumpBtn.width - Style.space(32)
                     elide: Text.ElideRight
                     anchors.verticalCenter: parent.verticalCenter
+                  }
+                  Button {
+                    id: queueJumpBtn
+                    text: "Now"
+                    foreground: Color.accent
+                    horizontalPadding: Style.spacing.controlPaddingX
+                    verticalPadding: Style.spacing.controlPaddingY
+                    onClicked: if (root.mediaService) root.mediaService.jumpToQueueCurrent()
                   }
                   Button {
                     id: queueNowBtn
@@ -1639,6 +1800,15 @@ Panel {
                       if (root.mediaService) root.mediaService.queueCurrentTrack()
                       root.armHoldOpen(1500)
                     }
+                  }
+                  Button {
+                    id: saveQueueBtn
+                    text: "Save"
+                    foreground: root.foreground
+                    enabled: root.queueTotal > 0 && !root.queueBusy
+                    horizontalPadding: Style.spacing.controlPaddingX
+                    verticalPadding: Style.spacing.controlPaddingY
+                    onClicked: if (root.mediaService) root.mediaService.saveCurrentQueue()
                   }
                   Button {
                     id: clearQueueBtn
@@ -1655,23 +1825,84 @@ Panel {
                   }
                 }
 
+                TextField {
+                  width: parent.width
+                  foreground: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  placeholderText: "Filter queue by title, artist, source, or path…"
+                  text: root.queueFilterText
+                  onTextChanged: root.queueFilterText = text
+                }
+
+                Text {
+                  width: parent.width
+                  visible: root.queueTotal > 0
+                  textFormat: Text.PlainText
+                  text: "NOW PLAYING · " + (root.usingMpv ? "VIDEO · " : "AUDIO · ") + (root.title || "Unknown track")
+                  color: Color.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  width: parent.width
+                  visible: root.queueTotal > 0
+                  textFormat: Text.PlainText
+                  text: "Audio and video queues are listed together; playback continues when this drawer is closed."
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+
+                Flow {
+                  width: parent.width
+                  spacing: Style.space(6)
+                  visible: root.savedQueues.length > 0
+                  Repeater {
+                    model: root.savedQueues
+                    delegate: Row {
+                      required property var modelData
+                      required property int index
+                      spacing: Style.space(2)
+                      Button {
+                        text: String((modelData && modelData.name) || "Saved queue")
+                        foreground: root.foreground
+                        horizontalPadding: Style.space(8)
+                        verticalPadding: Style.space(3)
+                        onClicked: {
+                          if (root.mediaService) root.mediaService.restoreSavedQueue(index)
+                          root.armHoldOpen(1200)
+                        }
+                      }
+                      Button {
+                        text: "×"
+                        foreground: root.dim
+                        horizontalPadding: Style.space(5)
+                        verticalPadding: Style.space(3)
+                        onClicked: if (root.mediaService) root.mediaService.deleteSavedQueue(index)
+                      }
+                    }
+                  }
+                }
+
                 Repeater {
                   model: {
                     var _t = root.queueTotal
-                    var items = root.queueItems || []
-                    var start = Math.max(0, root.queueIndex)
-                    var slice = []
-                    for (var i = start; i < items.length && slice.length < 8; i++)
-                      slice.push(items[i])
-                    return slice
+                    var videos = root.videoQueueItems.length
+                    var tick = root.mediaService ? root.mediaService.mpvPlaylistTick : 0
+                    return root.filteredUnifiedQueueItems.slice(0, 12)
                   }
                   delegate: Item {
                     required property var modelData
                     required property int index
                     width: parent ? parent.width : 0
                     height: Style.space(32)
-                    readonly property bool isCurrent: modelData && modelData.index === root.queueIndex
-                    readonly property int qIndex: modelData ? Number(modelData.index) : -1
+                    readonly property bool isCurrent: !!(modelData && modelData.current)
+                    readonly property string backend: String((modelData && modelData.backend) || "audio")
+                    readonly property int qIndex: modelData ? Number(modelData.backendIndex) : -1
 
                     Text {
                       anchors.left: parent.left
@@ -1679,7 +1910,7 @@ Panel {
                       anchors.rightMargin: Style.space(8)
                       anchors.verticalCenter: parent.verticalCenter
                       textFormat: Text.PlainText
-                      text: (isCurrent ? "▶ " : "  ") + String((modelData && modelData.title) || "Track")
+                      text: (isCurrent ? "▶ " : "  ") + (backend === "video" ? "VIDEO · " : "AUDIO · ") + String((modelData && modelData.title) || "Track")
                       color: isCurrent ? Color.accent : root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
@@ -1704,7 +1935,11 @@ Panel {
                           anchors.fill: parent
                           cursorShape: Qt.PointingHandCursor
                           onClicked: {
-                            if (root.mediaService) root.mediaService.playNextQueueIndex(qIndex)
+                            if (root.mediaService) {
+                              if (backend === "video") root.mediaService.moveVideoQueueIndex(qIndex, Math.max(0, Number(root.mediaService.mpv.playlistPos || 0) + 1))
+                              else root.mediaService.playNextQueueIndex(qIndex)
+                              root.mediaService.playNextQueueOrderItem(modelData)
+                            }
                             root.armHoldOpen(1200)
                           }
                         }
@@ -1723,7 +1958,11 @@ Panel {
                           enabled: qIndex > 0
                           cursorShape: Qt.PointingHandCursor
                           onClicked: {
-                            if (root.mediaService) root.mediaService.moveQueueIndex(qIndex, qIndex - 1)
+                            if (root.mediaService) {
+                              if (backend === "video") root.mediaService.moveVideoQueueIndex(qIndex, qIndex - 1)
+                              else root.mediaService.moveQueueIndex(qIndex, qIndex - 1)
+                              root.mediaService.reorderQueueOrderItem(modelData, -1)
+                            }
                             root.armHoldOpen(1000)
                           }
                         }
@@ -1740,7 +1979,11 @@ Panel {
                           anchors.fill: parent
                           cursorShape: Qt.PointingHandCursor
                           onClicked: {
-                            if (root.mediaService) root.mediaService.moveQueueIndex(qIndex, qIndex + 1)
+                            if (root.mediaService) {
+                              if (backend === "video") root.mediaService.moveVideoQueueIndex(qIndex, qIndex + 1)
+                              else root.mediaService.moveQueueIndex(qIndex, qIndex + 1)
+                              root.mediaService.reorderQueueOrderItem(modelData, 1)
+                            }
                             root.armHoldOpen(1000)
                           }
                         }
@@ -1757,7 +2000,11 @@ Panel {
                           anchors.fill: parent
                           cursorShape: Qt.PointingHandCursor
                           onClicked: {
-                            if (root.mediaService) root.mediaService.removeQueueIndex(qIndex)
+                            if (root.mediaService) {
+                              if (backend === "video") root.mediaService.removeVideoQueueIndex(qIndex)
+                              else root.mediaService.removeQueueIndex(qIndex)
+                              root.mediaService.removeQueueOrderItem(modelData)
+                            }
                             root.armHoldOpen(1000)
                           }
                         }
@@ -1772,7 +2019,8 @@ Panel {
                       cursorShape: Qt.PointingHandCursor
                       onClicked: {
                         if (root.mediaService && modelData)
-                          root.mediaService.playQueueIndex(modelData.index)
+                          if (modelData.backend === "video") root.mediaService.playVideoQueueIndex(modelData.backendIndex)
+                          else root.mediaService.playQueueIndex(modelData.index)
                         root.armHoldOpen(1500)
                       }
                     }
@@ -1867,6 +2115,29 @@ Panel {
                         }
                       }
                     }
+                  }
+                }
+
+                Row {
+                  width: parent.width
+                  spacing: Style.space(8)
+                  Text {
+                    id: resumePlaybackLabel
+                    textFormat: Text.PlainText
+                    text: "Resume last track and position"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                  Item { width: Math.max(0, parent.width - resumePlaybackLabel.width - resumePlaybackBtn.width - Style.space(8)); height: 1 }
+                  Button {
+                    id: resumePlaybackBtn
+                    text: root.resumePlayback ? "On" : "Off"
+                    foreground: root.resumePlayback ? Color.accent : root.foreground
+                    horizontalPadding: Style.space(10)
+                    verticalPadding: Style.space(3)
+                    onClicked: if (root.mediaService) root.mediaService.setResumePlayback(!root.resumePlayback)
                   }
                 }
 
@@ -2138,7 +2409,8 @@ Panel {
                       height: Style.space(30)
                       Text {
                         anchors.left: parent.left
-                        anchors.right: parent.right
+                        anchors.right: queueStation.left
+                        anchors.rightMargin: Style.space(8)
                         anchors.verticalCenter: parent.verticalCenter
                         textFormat: Text.PlainText
                         text: {
@@ -2151,8 +2423,25 @@ Panel {
                         font.pixelSize: Style.font.caption
                         elide: Text.ElideRight
                       }
+                      Text {
+                        id: queueStation
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        textFormat: Text.PlainText
+                        text: "󰐑"
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                        MouseArea {
+                          anchors.fill: parent
+                          anchors.margins: -Style.space(6)
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: root.queueHit(modelData)
+                        }
+                      }
                       MouseArea {
                         anchors.fill: parent
+                        anchors.rightMargin: Style.space(30)
                         cursorShape: Qt.PointingHandCursor
                         onClicked: {
                           if (root.mediaService && modelData)
@@ -2815,7 +3104,7 @@ Panel {
                       spacing: Style.space(10)
 
                       Column {
-                        width: parent.width - Style.space(36)
+                        width: parent.width - Style.space(64)
                         spacing: Style.space(2)
                         Text {
                           width: parent.width
@@ -2847,6 +3136,21 @@ Panel {
 
                       Text {
                         textFormat: Text.PlainText
+                        text: root.mediaService && root.mediaService.isHitQueued(recentRow.hit) ? "✓" : "󰐑"
+                        color: root.mediaService && root.mediaService.isHitQueued(recentRow.hit) ? Color.accent : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                        anchors.verticalCenter: parent.verticalCenter
+                        MouseArea {
+                          anchors.fill: parent
+                          anchors.margins: -Style.space(6)
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: root.queueHit(recentRow.hit)
+                        }
+                      }
+
+                      Text {
+                        textFormat: Text.PlainText
                         text: root.hitIsFavorite(recentRow.hit) ? "󰋑" : "󰋕"
                         color: root.hitIsFavorite(recentRow.hit) ? Color.accent : root.dim
                         font.family: root.fontFamily
@@ -2863,7 +3167,7 @@ Panel {
 
                     MouseArea {
                       anchors.fill: parent
-                      anchors.rightMargin: Style.space(36)
+                      anchors.rightMargin: Style.space(60)
                       hoverEnabled: true
                       cursorShape: Qt.PointingHandCursor
                       acceptedButtons: Qt.LeftButton | Qt.RightButton
@@ -2931,7 +3235,7 @@ Panel {
                     spacing: Style.space(10)
 
                     Column {
-                      width: parent.width - Style.space(36)
+                      width: parent.width - Style.space(64)
                       spacing: Style.space(2)
                       Text {
                         width: parent.width
@@ -2965,6 +3269,21 @@ Panel {
 
                     Text {
                       textFormat: Text.PlainText
+                      text: root.mediaService && root.mediaService.isHitQueued(favRow.hit) ? "✓" : "󰐑"
+                      color: root.mediaService && root.mediaService.isHitQueued(favRow.hit) ? Color.accent : root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      anchors.verticalCenter: parent.verticalCenter
+                      MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -Style.space(6)
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.queueHit(favRow.hit)
+                      }
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
                       text: "󰋑"
                       color: Color.accent
                       font.family: root.fontFamily
@@ -2981,7 +3300,7 @@ Panel {
 
                   MouseArea {
                     anchors.fill: parent
-                    anchors.rightMargin: Style.space(36)
+                    anchors.rightMargin: Style.space(60)
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
                     acceptedButtons: Qt.LeftButton | Qt.RightButton
@@ -3339,6 +3658,22 @@ Panel {
                     Text {
                       anchors.verticalCenter: parent.verticalCenter
                       textFormat: Text.PlainText
+                      text: root.mediaService && root.mediaService.isHitQueued(dlRow.item) ? "✓" : "󰐑"
+                      color: root.mediaService && root.mediaService.isHitQueued(dlRow.item) ? Color.accent : root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      visible: !!(dlRow.item && dlRow.item.path && !dlRow.isFailed && !dlRow.isBusy)
+                      MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -Style.space(6)
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.queueHit({ title: dlRow.item.title, artist: dlRow.item.artist, path: dlRow.item.path, provider: "local", kind: "local" })
+                      }
+                    }
+
+                    Text {
+                      anchors.verticalCenter: parent.verticalCenter
+                      textFormat: Text.PlainText
                       text: "󰉋"
                       color: root.dim
                       font.family: root.fontFamily
@@ -3377,7 +3712,7 @@ Panel {
 
                   MouseArea {
                     anchors.fill: parent
-                    anchors.rightMargin: Style.space(56)
+                    anchors.rightMargin: Style.space(76)
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
                     enabled: !dlRow.isBusy && !dlRow.isFailed && !!(dlRow.item && dlRow.item.path)
@@ -3721,8 +4056,8 @@ Panel {
 
                     Text {
                       textFormat: Text.PlainText
-                      text: "󰐑"
-                      color: root.dim
+                      text: root.mediaService && root.mediaService.isHitQueued(hitRow.hit) ? "✓" : "󰐑"
+                      color: root.mediaService && root.mediaService.isHitQueued(hitRow.hit) ? Color.accent : root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
                       anchors.verticalCenter: parent.verticalCenter
@@ -3835,7 +4170,7 @@ Panel {
                     }
 
                     Button {
-                      text: "Queue"
+                      text: root.mediaService && root.mediaService.isHitQueued(root.contextHit) ? "Already queued" : "Add to queue"
                       foreground: root.foreground
                       horizontalPadding: Style.spacing.controlPaddingX
                       verticalPadding: Style.spacing.controlPaddingY

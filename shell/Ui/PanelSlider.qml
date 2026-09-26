@@ -17,6 +17,10 @@ Item {
   property real trackHeight: Math.max(4, Math.round(Style.spacing.controlHeight * 0.11))
   property real knobSize: Math.max(14, Math.round(Style.spacing.controlHeight * 0.38))
   property real liveValue: value
+  property real selectionStart: -1
+  property real selectionEnd: -1
+  property color selectionColor: Color.accent
+  property bool selectionDraggable: false
 
   // macOS-style notches. When > 1, that many evenly-spaced tick marks are cut
   // into the track (drawn in the panel background color, so only the part
@@ -29,6 +33,7 @@ Item {
 
   signal moved(real value)
   signal released(real value)
+  signal selectionMoved(real value, int endpoint)
 
   // Right-click is a secondary action on the whole track — audio uses it to
   // mute the channel the slider belongs to. Dragging stays left-button only.
@@ -63,6 +68,64 @@ Item {
     Behavior on width {
       enabled: !root.dragging
       NumberAnimation { duration: 140; easing.type: Easing.OutCubic }
+    }
+  }
+
+  // Optional selected interval, used by the media A–B section loop.
+  Rectangle {
+    id: selection
+    anchors.verticalCenter: track.verticalCenter
+    height: track.height
+    radius: track.radius
+    color: root.selectionColor
+    opacity: 0.72
+    visible: root.selectionStart >= root.minimum && root.selectionEnd > root.selectionStart
+      && root.selectionEnd <= root.maximum
+    x: visible ? track.width * ((root.selectionStart - root.minimum) / root.range) : 0
+    width: visible ? track.width * ((root.selectionEnd - root.selectionStart) / root.range) : 0
+  }
+
+  Repeater {
+    model: selection.visible ? 2 : 0
+    Item {
+      required property int index
+      z: 10
+      readonly property real endpointValue: index === 0 ? root.selectionStart : root.selectionEnd
+      width: Math.max(20, Style.space(20))
+      height: Math.max(root.knobSize, root.trackHeight + Style.space(8))
+      anchors.verticalCenter: track.verticalCenter
+      x: {
+        var endpoint = index === 0 ? root.selectionStart : root.selectionEnd
+        return Math.max(0, Math.min(track.width - width,
+          track.width * ((endpoint - root.minimum) / root.range) - width / 2))
+      }
+
+      Rectangle {
+        width: Math.max(2, Style.space(2))
+        height: root.trackHeight + Style.space(8)
+        radius: width / 2
+        color: root.selectionColor
+        anchors.centerIn: parent
+      }
+
+      MouseArea {
+        anchors.fill: parent
+        visible: root.selectionDraggable
+        cursorShape: Qt.SizeHorCursor
+        drag.target: null
+        onPositionChanged: function(mouse) {
+          if (!(mouse.buttons & Qt.LeftButton)) return
+          var point = mapToItem(root, mouse.x, mouse.y)
+          var localX = Math.max(0, Math.min(track.width, point.x))
+          root.selectionMoved(root.minimum + localX / track.width * root.range, index)
+        }
+        onPressed: function(mouse) {
+          if (mouse.button !== Qt.LeftButton) return
+          var point = mapToItem(root, mouse.x, mouse.y)
+          var localX = Math.max(0, Math.min(track.width, point.x))
+          root.selectionMoved(root.minimum + localX / track.width * root.range, index)
+        }
+      }
     }
   }
 
