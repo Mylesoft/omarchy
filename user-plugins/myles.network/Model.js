@@ -415,6 +415,684 @@ function protonAuthRequired(raw) {
     || text.indexOf("please sig") >= 0
 }
 
+// ---------------------------------------------------------------------------
+// Stored profiles, link facts and host extras
+//
+// The plugin's own probes (net-profiles.sh, net-link.sh, net-extras.sh,
+// net-scan.sh) all emit the same shape: `key<TAB>value` lines, records
+// separated by a line holding only `--`. Backslash, tab and carriage return are
+// escaped by the probe because an SSID or a profile name is an arbitrary byte
+// string and none of them are guaranteed to avoid any of those.
+//
+// Everything below is pure so it stays testable outside the shell.
+// ---------------------------------------------------------------------------
+
+// Reverse of the probe-side escaping. Unescaping has to run as a single pass:
+// a literal `\t` in an SSID is indistinguishable from an escape sequence once
+// the substitutions start rewriting backslashes.
+function unescapeField(value) {
+  var raw = String(value === undefined || value === null ? "" : value)
+  var out = ""
+  for (var i = 0; i < raw.length; i++) {
+    var ch = raw.charAt(i)
+    if (ch !== "\\") {
+      out += ch
+      continue
+    }
+    var next = raw.charAt(i + 1)
+    if (next === "t") out += "\t"
+    else if (next === "\\") out += "\\"
+    else out += "\\"
+    i++
+  }
+  return out
+}
+
+// `key<TAB>value` lines grouped into records on the `--` separator.
+function parseRecords(raw) {
+  var text = String(raw || "")
+  var lines = text.split("\n")
+  var records = []
+  var current = null
+
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i]
+    if (line.charAt(line.length - 1) === "\r") line = line.slice(0, -1)
+    if (line === "") continue
+
+    if (line === "--") {
+      if (current) records.push(current)
+      current = null
+      continue
+    }
+
+    var tab = line.indexOf("\t")
+    if (tab === -1) continue
+    if (!current) current = {}
+
+    var key = unescapeField(line.slice(0, tab))
+    var value = unescapeField(line.slice(tab + 1))
+
+    // A probe that appends a second section header without terminating the
+    // record puts two `kind` keys in one record. Keeping only the last would
+    // orphan the first section's fields, so a repeated key collects into an
+    // array and the section readers below iterate it.
+    if (Object.prototype.hasOwnProperty.call(current, key)) {
+      if (Array.isArray(current[key])) current[key].push(value)
+      else current[key] = [current[key], value]
+    } else {
+      current[key] = value
+    }
+  }
+
+  if (current) records.push(current)
+  return records
+}
+
+// Every `kind` a record declares, in order. A record from a well-formed probe
+// has exactly one; a merged one is still fully readable.
+function kindList(record) {
+  if (!record || !Object.prototype.hasOwnProperty.call(record, "kind")) return []
+  var value = record.kind
+  if (Array.isArray(value)) return value
+  return [String(value)]
+}
+
+// nmcli reports these as the literal placeholder when a field is unset.
+function isUnset(value) {
+  var v = String(value === undefined || value === null ? "" : value).trim()
+  return v === "" || v === "--"
+}
+
+function cleanField(record, key) {
+  if (!record) return ""
+  var value = record[key]
+  // A repeated key arrives as an array; the last occurrence is the one the
+  // probe wrote most recently, which is the one that applies.
+  if (Array.isArray(value)) value = value.length ? value[value.length - 1] : ""
+  return isUnset(value) ? "" : String(value).trim()
+}
+
+function intField(record, key, fallback) {
+  var value = parseInt(cleanField(record, key), 10)
+  return isFinite(value) ? value : fallback
+}
+
+// Profiles, ordered the way the panel shows them: Wi-Fi before Ethernet, then
+// auto-connect priority (descending), then name. A saved profile that
+// autoconnects outranks one that does not, because that is the order
+// NetworkManager itself will consider them in.
+function sortProfiles(profiles) {
+  var list = Array.isArray(profiles) ? profiles.slice() : []
+  list.sort(function(a, b) {
+    var aWifi = a.type === "802-11-wireless" ? 0 : 1
+    var bWifi = b.type === "802-11-wireless" ? 0 : 1
+    if (aWifi !== bWifi) return aWifi - bWifi
+    if (a.priority !== b.priority) return b.priority - a.priority
+    if (a.autoconnect !== b.autoconnect) return a.autoconnect ? -1 : 1
+    return String(a.name || "").localeCompare(String(b.name || ""))
+  })
+  return list
+}
+
+function parseProfileRecord(record) {
+  if (!record) return null
+  var uuid = cleanField(record, "uuid")
+  if (!uuid) return null
+
+  return {
+    uuid: uuid,
+    name: cleanField(record, "name") || uuid,
+    type: cleanField(record, "type"),
+    iface: cleanField(record, "iface"),
+    autoconnect: cleanField(record, "autoconnect") === "yes",
+    priority: intField(record, "priority", 0),
+    method: cleanField(record, "method"),
+    addresses: cleanField(record, "addresses"),
+    gateway: cleanField(record, "gateway"),
+    dns: cleanField(record, "dns"),
+    ssid: cleanField(record, "ssid"),
+    clonedMac: cleanField(record, "clonedMac"),
+    wol: cleanField(record, "wol"),
+    pinnedSpeed: intField(record, "pinnedSpeed", 0),
+    pinnedDuplex: cleanField(record, "pinnedDuplex"),
+    eap: cleanField(record, "eap") === "yes",
+    active: cleanField(record, "active"),
+    isWifi: cleanField(record, "type") === "802-11-wireless",
+    isWired: cleanField(record, "type") === "802-3-ethernet"
+  }
+}
+
+// net-profiles.sh output -> { profiles, blocklist }. Blocklist entries are
+// BSSIDs; they are kept as a set-like array because the probe sorts and dedupes
+// but the panel only ever asks "is this one present".
+function parseProfiles(raw) {
+  var records = parseRecords(raw)
+  var profiles = []
+  var blocklist = []
+  var section = ""
+
+  for (var i = 0; i < records.length; i++) {
+    var kind = cleanField(records[i], "kind")
+    if (kind === "profiles") { section = "profiles"; continue }
+    if (kind === "blocklist") { section = "blocklist"; continue }
+    if (section === "") continue
+
+    if (section === "blocklist") {
+      var bssid = cleanField(records[i], "bssid")
+      if (bssid) blocklist.push(bssid.toLowerCase())
+      continue
+    }
+
+    // A record that still carries data after a `kind` header belongs to that
+    // section, so parse it rather than dropping it. The probes terminate every
+    // header with `--`, but losing a profile silently is too expensive a
+    // failure mode to rely on that alone.
+    var profile = parseProfileRecord(records[i])
+    if (profile) profiles.push(profile)
+  }
+
+  return { profiles: sortProfiles(profiles), blocklist: blocklist }
+}
+
+function isBlocked(blocklist, bssid) {
+  if (!bssid) return false
+  var list = Array.isArray(blocklist) ? blocklist : []
+  var needle = String(bssid).toLowerCase()
+  for (var i = 0; i < list.length; i++) {
+    if (String(list[i]).toLowerCase() === needle) return true
+  }
+  return false
+}
+
+function parseLink(raw) {
+  var records = parseRecords(raw)
+  var link = {
+    exists: false,
+    operstate: "",
+    carrier: "",
+    mtu: "",
+    mac: "",
+    speed: "",
+    duplex: "",
+    phyType: "",
+    driver: "",
+    autoNegotiated: "",
+    ethtool: false,
+    ethtoolSpeed: "",
+    ethtoolDuplex: "",
+    autoneg: "",
+    linkDetected: "",
+    maxSpeed: 0,
+    rxErrors: null,
+    txErrors: null,
+    rxDropped: null,
+    txDropped: null,
+    rxCrcErrors: null,
+    collisions: null
+  }
+
+  for (var i = 0; i < records.length; i++) {
+    var record = records[i]
+
+    // Selected by the presence of `exists` rather than by a `kind` header:
+    // the probe emits the header as its own record, and keying off the header
+    // would silently skip the very record that carries the data.
+    if (!Object.prototype.hasOwnProperty.call(record, "exists")) continue
+    if (cleanField(record, "exists") !== "yes") return link
+
+    link.exists = true
+    link.operstate = cleanField(record, "operstate")
+    link.carrier = cleanField(record, "carrier")
+    link.mtu = cleanField(record, "mtu")
+    link.mac = cleanField(record, "mac")
+    link.speed = cleanField(record, "speed")
+    link.duplex = cleanField(record, "duplex")
+    link.phyType = cleanField(record, "phyType")
+    link.driver = cleanField(record, "driver")
+    link.autoNegotiated = cleanField(record, "autoNegotiated")
+    link.ethtool = cleanField(record, "ethtool") === "yes"
+    link.ethtoolSpeed = cleanField(record, "ethtoolSpeed")
+    link.ethtoolDuplex = cleanField(record, "ethtoolDuplex")
+    link.autoneg = cleanField(record, "autoneg")
+    link.linkDetected = cleanField(record, "linkDetected")
+    link.maxSpeed = intField(record, "maxSpeed", 0)
+
+    // Counters are emitted only when the kernel accounts them, so a null here
+    // means "not available for this interface", never "zero".
+    var counters = {
+      rxErrors: "rxErrors",
+      txErrors: "txErrors",
+      rxDropped: "rxDropped",
+      txDropped: "txDropped",
+      rxCrcErrors: "rxCrcErrors",
+      collisions: "collisions"
+    }
+    for (var key in counters) {
+      if (!Object.prototype.hasOwnProperty.call(counters, key)) continue
+      var raw2 = record[counters[key]]
+      if (!isUnset(raw2)) link[key] = intField(record, counters[key], 0)
+    }
+    break
+  }
+
+  return link
+}
+
+// The one actionable thing a link probe can tell you: the negotiated speed is
+// below what the hardware or the profile asked for. Returns "" when there is
+// nothing wrong, and a null when the facts are insufficient to judge -- the
+// panel must not claim a fault it cannot evidence.
+function linkSpeedWarning(link, profile) {
+  if (!link || !link.exists) return ""
+  if (link.operstate !== "up") return ""
+
+  var negotiated = parseInt(link.speed, 10)
+  if (!isFinite(negotiated) || negotiated <= 0) return ""
+
+  // A profile that pins a speed and negotiated lower is unambiguously wrong:
+  // the user asked for a rate the link did not deliver.
+  var pinned = profile && profile.pinnedSpeed ? parseInt(profile.pinnedSpeed, 10) : 0
+  if (isFinite(pinned) && pinned > 0 && negotiated < pinned) {
+    return "Linked at " + formatLinkSpeed(negotiated) + ", profile asks for " + formatLinkSpeed(pinned)
+  }
+
+  // Otherwise the ceiling is the NIC's own fastest supported mode, which needs
+  // ethtool. Without it there is nothing to compare against.
+  if (link.maxSpeed > 0 && negotiated < link.maxSpeed) {
+    return "Linked at " + formatLinkSpeed(negotiated) + " of " + formatLinkSpeed(link.maxSpeed) + " supported"
+  }
+
+  return ""
+}
+
+// Half duplex on a modern gigabit-capable port is almost always a cable or
+// autoneg fault, and it is worth saying so rather than showing "500 Mbit/s".
+function linkDuplexWarning(link) {
+  if (!link || !link.exists) return ""
+  if (link.operstate !== "up") return ""
+  if (String(link.duplex).toLowerCase() !== "half") return ""
+  return "Half duplex"
+}
+
+function formatLinkSpeed(mbps) {
+  var value = parseInt(mbps, 10)
+  if (!isFinite(value) || value <= 0) return ""
+  if (value >= 1000) {
+    var gbit = value / 1000
+    return (Math.round(gbit * 10) / 10) + "gbit"
+  }
+  return value + "mbit"
+}
+
+function parseScan(raw) {
+  var records = parseRecords(raw)
+  var out = []
+  for (var i = 0; i < records.length; i++) {
+    var record = records[i]
+    var kind = cleanField(record, "kind")
+    if (kind === "scan" || cleanField(record, "bssid") === "") continue
+    var bssid = cleanField(record, "bssid")
+    if (!bssid) continue
+    out.push({
+      ssid: cleanField(record, "ssid"),
+      bssid: bssid,
+      mode: cleanField(record, "mode"),
+      band: cleanField(record, "band"),
+      chan: cleanField(record, "chan"),
+      freq: cleanField(record, "freq"),
+      rate: cleanField(record, "rate"),
+      signal: intField(record, "signal", -1),
+      security: cleanField(record, "security"),
+      inUse: cleanField(record, "inUse") === "yes",
+      dbm: cleanField(record, "dbm"),
+      width: cleanField(record, "width"),
+      rxBitrate: cleanField(record, "rxBitrate"),
+      txBitrate: cleanField(record, "txBitrate")
+    })
+  }
+  return out
+}
+
+// Best per-SSID view of the scan detail: a band-steered AP reports one BSSID
+// per band, and the row is keyed on SSID, so prefer the in-use BSSID, then the
+// strongest, then the 5/6 GHz one.
+function scanRecordForSsid(scan, ssid) {
+  var list = Array.isArray(scan) ? scan : []
+  var needle = String(ssid === undefined || ssid === null ? "" : ssid)
+  var best = null
+
+  for (var i = 0; i < list.length; i++) {
+    var entry = list[i]
+    if (!entry || entry.ssid !== needle) continue
+    if (entry.inUse) return entry
+    if (!best) { best = entry; continue }
+    if (entry.signal > best.signal) best = entry
+  }
+  return best
+}
+
+function parseExtras(raw) {
+  var records = parseRecords(raw)
+  var extras = {
+    dns: [],
+    dnsCount: 0,
+    dnsUnavailable: false,
+    v6: [],
+    v6Count: 0,
+    firewallUnit: "",
+    firewallRules: null,
+    firewallReadable: false,
+    tailscale: { installed: false, state: "", hostName: "", dnsName: "", ipv4: "", activePeers: 0, tailnetPeers: 0, exitNode: false }
+  }
+
+  // One pass, no section state. Every record is mined for the keys it happens
+  // to carry: a `kind` header names the section a record's named fields belong
+  // to, while the positional dns1../v6.. families are recognised by shape and
+  // are only ever emitted inside the extras section. Deriving sections from
+  // record boundaries was the bug this replaces -- a probe that appends a
+  // header without terminating the previous record silently orphaned a whole
+  // field family, and no amount of parser strictness catches that.
+  for (var i = 0; i < records.length; i++) {
+    var record = records[i]
+
+    // A record may declare more than one section when a probe appends a header
+    // without terminating the previous record, so every declared kind is
+    // applied rather than just the last.
+    var kinds = kindList(record)
+    for (var k = 0; k < kinds.length; k++) {
+      var kind = String(kinds[k]).trim()
+
+      if (kind === "extras") {
+        if (cleanField(record, "dnsUnavailable") === "yes") extras.dnsUnavailable = true
+        var unit = cleanField(record, "firewallUnit")
+        if (unit) extras.firewallUnit = unit
+        if (cleanField(record, "firewallReadable") === "yes") {
+          extras.firewallReadable = true
+          extras.firewallRules = intField(record, "firewallRules", 0)
+        }
+      } else if (kind === "tailscale") {
+        if (cleanField(record, "installed") === "yes") extras.tailscale.installed = true
+        var state = cleanField(record, "backendState")
+        if (state) extras.tailscale.state = state
+        extras.tailscale.hostName = cleanField(record, "hostName")
+        extras.tailscale.dnsName = cleanField(record, "dnsName")
+        extras.tailscale.ipv4 = cleanField(record, "ipv4")
+        extras.tailscale.activePeers = intField(record, "activePeers", 0)
+        extras.tailscale.tailnetPeers = intField(record, "tailnetPeers", 0)
+        if (cleanField(record, "exitNode") === "true") extras.tailscale.exitNode = true
+      }
+    }
+
+    for (var key in record) {
+      if (!Object.prototype.hasOwnProperty.call(record, key)) continue
+      if (/^dns[0-9]+$/.test(key)) extras.dns.push(record[key])
+      else if (/^v6[0-9]+$/.test(key)) extras.v6.push(record[key])
+    }
+  }
+
+  extras.dnsCount = extras.dns.length
+  extras.v6Count = extras.v6.length
+
+  return extras
+}
+
+// Firewall posture, from what the probe could actually establish.
+//
+// The sudo check is incidental and must not drive the headline: on a machine
+// with no nftables service at all, the ruleset is unreadable for the same
+// reason it is empty, and reporting "needs root" there would imply rules exist
+// to be counted. `systemctl is-active` answers "inactive" for both a stopped
+// unit and one that is not installed, so "Not running" is the most this can
+// honestly claim.
+function firewallLabel(extras) {
+  if (!extras) return "Unknown"
+
+  // The probe has not reported yet: this is "not probed", not "not running".
+  var probed = extras.firewallUnit !== undefined || extras.firewallReadable !== undefined
+  if (!probed) return "Unknown"
+
+  if (extras.firewallUnit !== "active") return "Not running"
+  if (!extras.firewallReadable) return "Running · count needs root"
+
+  var rules = extras.firewallRules === null || extras.firewallRules === undefined ? 0 : extras.firewallRules
+  if (rules === 0) return "Running · no rules"
+  return "Running · " + rules + " rule" + (rules === 1 ? "" : "s")
+}
+
+// Tailscale's BackendState is a fixed vocabulary; only the states that mean
+// something actionable to a person get a sentence.
+function tailscaleLabel(tailscale) {
+  if (!tailscale) return ""
+  if (!tailscale.installed) return "Not installed"
+  switch (tailscale.state) {
+    case "Running":
+      return "Connected" + (tailscale.ipv4 ? " · " + tailscale.ipv4 : "")
+    case "Stopped":
+      return "Stopped"
+    case "NeedsLogin":
+      return "Needs sign-in"
+    case "NeedsMachineAuth":
+      return "Needs machine authorisation"
+    case "Starting":
+      return "Starting"
+    case "NoState":
+      return ""
+    default:
+      return tailscale.state || "Unknown"
+  }
+}
+
+function tailscaleBusy(tailscale) {
+  if (!tailscale || !tailscale.installed) return false
+  return tailscale.state === "Starting" || tailscale.state === "Stopping"
+}
+
+// nmcli's ipv4.method vocabulary, as something a person would say. "auto" and
+// "dhcp" both mean the lease came from the network. An unset property arrives
+// as the literal placeholder, which is not a method and must not be echoed
+// back to the user as one.
+function profileMethodLabel(method, addresses) {
+  if (isUnset(method)) return "Unknown"
+  var value = String(method).toLowerCase()
+  switch (value) {
+    case "auto":
+    case "dhcp":
+    case "auto6":
+      return "DHCP"
+    case "manual":
+      return addresses ? "Static" : "Static · unset"
+    case "shared":
+      return "Shared"
+    case "link-local":
+      return "Link-local"
+    case "disabled":
+      return "Disabled"
+    case "":
+      return "Unknown"
+    default:
+      return value
+  }
+}
+
+function profileIsManual(profile) {
+  if (!profile) return false
+  return String(profile.method || "").toLowerCase() === "manual"
+}
+
+function profileIsDhcp(profile) {
+  if (!profile) return false
+  var value = String(profile.method || "").toLowerCase()
+  return value === "auto" || value === "dhcp" || value === "auto6"
+}
+
+// Strict IPv4 validation shared by the static profile editor and temporary
+// device setup flow. A shape-only regexp accepted values such as 999.2.3.4.
+function isIPv4(value) {
+  var parts = String(value === undefined || value === null ? "" : value).trim().split(".")
+  if (parts.length !== 4) return false
+  for (var i = 0; i < parts.length; i++) {
+    if (!/^\d{1,3}$/.test(parts[i])) return false
+    var octet = Number(parts[i])
+    if (octet < 0 || octet > 255) return false
+  }
+  return true
+}
+
+function ipv4InSubnet(address, networkAddress, prefix) {
+  if (!isIPv4(address) || !isIPv4(networkAddress)) return false
+  var bits = parseInt(prefix, 10)
+  if (!isFinite(bits) || bits < 0 || bits > 32) return false
+  function number(ip) {
+    return String(ip).split(".").reduce(function(value, part) {
+      return value * 256 + Number(part)
+    }, 0)
+  }
+  var mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0
+  return ((number(address) >>> 0) & mask) === ((number(networkAddress) >>> 0) & mask)
+}
+
+function ipv4UsableHost(address, prefix) {
+  if (!isIPv4(address)) return false
+  var bits = parseInt(prefix, 10)
+  if (!isFinite(bits) || bits < 1 || bits > 32) return false
+  if (bits >= 31) return true
+  var value = String(address).split(".").reduce(function(total, octet) {
+    return total * 256 + Number(octet)
+  }, 0) >>> 0
+  var hostBits = 32 - bits
+  var hostMask = Math.pow(2, hostBits) - 1
+  var host = value & hostMask
+  return host !== 0 && host !== hostMask
+}
+
+// nmcli represents "use the permanent hardware address" as the placeholder.
+function clonedMacLabel(value) {
+  var raw = String(value === undefined || value === null ? "" : value).trim()
+  if (raw === "" || raw === "--") return "Permanent"
+  if (/^(preserve|permanent|random)$/i.test(raw)) return raw.charAt(0).toUpperCase() + raw.slice(1)
+  return raw
+}
+
+function wolLabel(value) {
+  var raw = String(value === undefined || value === null ? "" : value).trim()
+  if (raw === "" || raw === "--" || raw === "0") return "Off"
+  return "Magic packet"
+}
+
+// Human label for a network's protection, replacing the single lock glyph.
+// The enum is passed in so this stays a pure function.
+function securityLabel(security, types) {
+  if (!types) return ""
+  switch (security) {
+    case types.Wpa3SuiteB192: return "WPA3 192-bit"
+    case types.Sae: return "WPA3"
+    case types.Wpa2Eap: return "WPA2 Enterprise"
+    case types.Wpa2Psk: return "WPA2"
+    case types.WpaEap: return "Enterprise"
+    case types.WpaPsk: return "WPA"
+    case types.StaticWep: return "WEP"
+    case types.DynamicWep: return "WEP"
+    case types.Leap: return "LEAP"
+    case types.Owe: return "OWE"
+    case types.Open: return "Open"
+    default: return ""
+  }
+}
+
+// Channel width comes from `iw link`, which reports it for 5/6 GHz links and
+// omits it for 20 MHz 2.4 GHz ones.
+//
+// It is deliberately NOT inferred from the negotiated bitrate: for a single
+// spatial stream 802.11ac puts both 40 MHz and 80 MHz at 866.7 Mbit/s, and
+// 802.11ax puts 20 MHz and 80 MHz at the same rate too, so any threshold
+// either invents a width the link does not have or hides one it does.
+function channelWidthLabel(record) {
+  var raw = String(record && record.width ? record.width : "").trim()
+  if (raw === "" || raw === "--") return ""
+  var value = parseInt(raw, 10)
+  if (!isFinite(value) || value <= 0) return ""
+  return value + " MHz"
+}
+
+function signalQualityLabel(dbm) {
+  var value = parseFloat(dbm)
+  if (!isFinite(value)) return ""
+  if (value >= -50) return "Excellent"
+  if (value >= -60) return "Good"
+  if (value >= -70) return "Fair"
+  if (value >= -80) return "Weak"
+  return "Very weak"
+}
+
+function formatMtu(value) {
+  var mtu = parseInt(value, 10)
+  return isFinite(mtu) && mtu > 0 ? String(mtu) : ""
+}
+
+// Thousands separators without Intl/Qt, so this stays a pure function the
+// Node test harness can call.
+function formatCounter(value) {
+  if (value === null || value === undefined) return "--"
+  var n = parseInt(value, 10)
+  if (!isFinite(n)) return "--"
+
+  var negative = n < 0
+  var digits = String(Math.abs(n))
+  var grouped = ""
+  for (var i = 0; i < digits.length; i++) {
+    if (i > 0 && (digits.length - i) % 3 === 0) grouped += ","
+    grouped += digits.charAt(i)
+  }
+  return (negative ? "-" : "") + grouped
+}
+
+function formatBitsPerSecond(bits) {
+  var value = parseFloat(bits)
+  if (!isFinite(value) || value <= 0) return ""
+  if (value >= 1000000000) return trimZero(value / 1000000000) + " Gbit/s"
+  if (value >= 1000000) return trimZero(value / 1000000) + " Mbit/s"
+  if (value >= 1000) return trimZero(value / 1000) + " kbit/s"
+  return value + " bit/s"
+}
+
+function trimZero(number) {
+  var rounded = Math.round(number * 10) / 10
+  return String(rounded)
+}
+
+// Public address lookup: the probe returns the address on stdout, and the exit
+// code is what distinguishes "no route", "DNS failure" and "a page that is not
+// the API" -- three states a user reads very differently.
+function publicIpState(raw, exitCode) {
+  var text = String(raw || "").trim()
+  if (exitCode !== 0 || text === "") return { ok: false, address: "" }
+  if (!/^[0-9a-fA-F:.]{3,45}$/.test(text)) return { ok: false, address: "" }
+  return { ok: true, address: text }
+}
+
+// Rate history for the throughput sparkline. The panel already computes
+// instantaneous rates from consecutive byte counters; this keeps the last N of
+// them so the same numbers can be drawn as a shape.
+function rateSeries(previous, download, upload, limit) {
+  var list = Array.isArray(previous) ? previous.slice() : []
+  var window = Math.max(1, parseInt(limit, 10) || 48)
+  list.push({ down: Math.max(0, Number(download) || 0), up: Math.max(0, Number(upload) || 0) })
+  while (list.length > window) list.shift()
+  return list
+}
+
+function rateSeriesPeak(series) {
+  var list = Array.isArray(series) ? series : []
+  var peak = 0
+  for (var i = 0; i < list.length; i++) {
+    if (!list[i]) continue
+    if (list[i].down > peak) peak = list[i].down
+    if (list[i].up > peak) peak = list[i].up
+  }
+  return peak
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     parseNetworkStatus: parseNetworkStatus,
@@ -448,6 +1126,38 @@ if (typeof module !== "undefined") {
     shouldRepromptPassphrase: shouldRepromptPassphrase,
     parseProtonStatus: parseProtonStatus,
     parseProtonAccount: parseProtonAccount,
-    protonAuthRequired: protonAuthRequired
+    protonAuthRequired: protonAuthRequired,
+    unescapeField: unescapeField,
+    parseRecords: parseRecords,
+    parseProfiles: parseProfiles,
+    sortProfiles: sortProfiles,
+    isBlocked: isBlocked,
+    parseLink: parseLink,
+    parseScan: parseScan,
+    scanRecordForSsid: scanRecordForSsid,
+    parseExtras: parseExtras,
+    linkSpeedWarning: linkSpeedWarning,
+    linkDuplexWarning: linkDuplexWarning,
+    formatLinkSpeed: formatLinkSpeed,
+    firewallLabel: firewallLabel,
+    tailscaleLabel: tailscaleLabel,
+    tailscaleBusy: tailscaleBusy,
+    profileMethodLabel: profileMethodLabel,
+    profileIsManual: profileIsManual,
+    profileIsDhcp: profileIsDhcp,
+    isIPv4: isIPv4,
+    ipv4InSubnet: ipv4InSubnet,
+    ipv4UsableHost: ipv4UsableHost,
+    clonedMacLabel: clonedMacLabel,
+    wolLabel: wolLabel,
+    securityLabel: securityLabel,
+    channelWidthLabel: channelWidthLabel,
+    signalQualityLabel: signalQualityLabel,
+    formatMtu: formatMtu,
+    formatCounter: formatCounter,
+    formatBitsPerSecond: formatBitsPerSecond,
+    publicIpState: publicIpState,
+    rateSeries: rateSeries,
+    rateSeriesPeak: rateSeriesPeak
   }
 }
